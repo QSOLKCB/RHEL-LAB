@@ -1,0 +1,29 @@
+# Local-only evidence and VM material
+local/
+out/
+captures/
+artifacts/
+*.iso
+*.qcow2
+*.vmdk
+*.vdi
+*.img
+*.vmcore
+*.core
+core
+core.*
+*.dump
+
+# Tokens and local configurations
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
