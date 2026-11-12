@@ -52,6 +52,37 @@ class PagesPolicyTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError):
             policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
+    def test_inline_pages_write_permission_rejected(self):
+        (self.workflows / "inline.yml").write_text(
+            "permissions: {pages: write}\n", encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_quoted_pages_write_permission_rejected(self):
+        (self.workflows / "quoted.yml").write_text(
+            'permissions:\n  "pages": write\n', encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_inline_quoted_mapping_and_value_rejected(self):
+        (self.workflows / "quoted.yml").write_text(
+            'permissions: {contents: read, "pages": "write"}\n',
+            encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_single_quoted_permissions_rejected(self):
+        (self.workflows / "quoted.yml").write_text(
+            "permissions:\n  'pages': 'write'\n", encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_similar_permission_value_not_rejected(self):
+        (self.workflows / "other.yml").write_text(
+            'permissions: {pages: readonly, contents: read}\n',
+            encoding="utf-8")
+        policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
     def test_deployment_action_rejected(self):
         (self.workflows / "bad.yaml").write_text(
             "steps:\n  - uses: actions/deploy-pages@v4\n", encoding="utf-8")
