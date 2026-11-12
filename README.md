@@ -6,6 +6,10 @@ RHEL-LAB is an Apache-2.0-licensed research workspace for controlled experiments
 
 > Status: RHEL-LAB-002 virtual-testbed tooling proposed for review. No RHEL VM has been installed, tested or booted by this repository.
 
+## No GitHub Pages / web deployment
+
+**Security policy:** no GitHub Pages site, hosted dashboard or public endpoint. GitHub's server-managed Pages workflow ran after the previous merge even though this repository contains no Pages deployment YAML. The current Pages site must be removed administratively, not by deleting our source-check workflow. See [Pages shutdown and prevention](docs/PAGES_SHUTDOWN.md). The separate CI guard reports a security-policy failure until GitHub's repository metadata explicitly shows Pages disabled.
+
 ## Research boundaries
 
 - Run experiments only on owned or explicitly authorized lab systems. No Red Hat-hosted services, third-party targets, or production infrastructure.
@@ -27,7 +31,8 @@ See [AGENTS.md](AGENTS.md), [SECURITY.md](SECURITY.md), and [docs/RESEARCH_PROTO
 | scripts/evidence.py | Dependency-free SHA-256 evidence inventory and verifier |
 | scripts/testbed.py | Operator-gated local KVM profile, auditing and offline disk snapshots |
 | tests/ | Safe standard-library unit tests |
-| .github/workflows/ci.yml | Non-privileged source checks only |
+| .github/workflows/ci.yml | Non-privileged source checks and no-Pages status policy |
+| scripts/pages_policy.py | Fail-closed offline check of GitHub's Pages metadata and committed workflow contents |
 
 ## Quick start
 

@@ -25,3 +25,21 @@ jobs:
         run: python -m compileall -q scripts tests
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+
+  pages-disabled:
+    name: Pages disabled (security policy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check GitHub event and committed workflows (no network)
+        run: |
+          python -m scripts.pages_policy \
+            --event "$GITHUB_EVENT_PATH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflows .github/workflows
