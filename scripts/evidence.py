@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -29,21 +30,31 @@ def inventory(input_dir: Path) -> dict:
     """List relative regular files in stable order; reject symlinks and special files."""
     root = _root(input_dir)
     files = []
-    for path in sorted(root.rglob("*"), key=lambda p: p.relative_to(root).as_posix()):
-        relative = path.relative_to(root).as_posix()
-        if path.is_symlink():
-            raise EvidenceError(f"symlink is not permitted: {relative}")
-        if path.is_dir():
-            continue
-        if not path.is_file():
-            raise EvidenceError(f"non-regular file is not permitted: {relative}")
-        digest = hashlib.sha256()
-        size = 0
-        with path.open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-                size += len(chunk)
-        files.append({"path": relative, "bytes": size, "sha256": digest.hexdigest()})
+    directories = [root]
+    while directories:
+        directory = directories.pop()
+        # pathlib.Path.rglob() may suppress scandir errors on some Python
+        # versions. Explicit scandir traversal makes incomplete evidence fatal.
+        with os.scandir(directory) as iterator:
+            children = sorted(iterator, key=lambda entry: entry.name)
+        for entry in children:
+            path = Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            if entry.is_symlink():
+                raise EvidenceError(f"symlink is not permitted: {relative}")
+            if entry.is_dir(follow_symlinks=False):
+                directories.append(path)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise EvidenceError(f"non-regular file is not permitted: {relative}")
+            digest = hashlib.sha256()
+            size = 0
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    size += len(chunk)
+            files.append({"path": relative, "bytes": size, "sha256": digest.hexdigest()})
+    files.sort(key=lambda item: item["path"])
     return {"schema": SCHEMA, "algorithm": "sha256", "files": files}
 
 
