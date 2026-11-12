@@ -1,6 +1,6 @@
 # Local RHEL lab setup — design checklist
 
-This document specifies containment prerequisites. It is not an installation script and no hardware or guest has been provisioned by this repository.
+This document specifies containment prerequisites. The companion scripts/testbed.py offers opt-in local VM preparation and snapshot commands, but no hardware or guest has been provisioned by repository CI. See VIRTUAL_TESTBED.md and DAYBREAK_GATE.md.
 
 ## Operator prerequisites
 

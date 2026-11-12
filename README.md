@@ -4,7 +4,7 @@
 
 RHEL-LAB is an Apache-2.0-licensed research workspace for controlled experiments on RHEL installations in isolated virtual machines running on owned or explicitly authorized hardware. The project prioritizes exact provenance, independently repeatable results, and responsible disclosure.
 
-> Status: RHEL-LAB-001 foundation. This repository does not contain a tested RHEL VM image, demonstrated vulnerability, or completed kernel-fuzzing campaign.
+> Status: RHEL-LAB-002 virtual-testbed tooling proposed for review. No RHEL VM has been installed, tested or booted by this repository.
 
 ## Research boundaries
 
@@ -25,6 +25,7 @@ See [AGENTS.md](AGENTS.md), [SECURITY.md](SECURITY.md), and [docs/RESEARCH_PROTO
 | docs/RESEARCH_PROTOCOL.md | Experiment gates, provenance, disclosure |
 | docs/ROADMAP.md | Phased milestones and acceptance criteria |
 | scripts/evidence.py | Dependency-free SHA-256 evidence inventory and verifier |
+| scripts/testbed.py | Operator-gated local KVM profile, auditing and offline disk snapshots |
 | tests/ | Safe standard-library unit tests |
 | .github/workflows/ci.yml | Non-privileged source checks only |
 
@@ -44,6 +45,20 @@ To inventory an evidence directory, write the manifest **outside** the evidence 
     uv run --no-project python scripts/evidence.py verify --input ./local/capture-001 --manifest ./local/capture-001.manifest.json
 
 The example requires the capture directory to exist. The manifest is deterministic (no generated timestamp), records relative paths, byte sizes and SHA-256 digests, rejects symlinks, and will not overwrite an existing manifest. For provenance, separately record target/kernel/package versions, test configuration, seed, exact source SHA, time, tool versions, and whether the test actually executed. A manifest establishes byte identity, not scientific validity.
+
+## Virtual testbed (RHEL-LAB-002)
+
+The optional KVM/QEMU testbed is **offline-first, local-only, and operator-gated**. It uses an unprivileged libvirt user connection, a VM profile with no virtual NIC, serial-console-only installation, and private disk/snapshot state outside the repository. It has no Pages deployment or public endpoint.
+
+- [Virtual Testbed guide](docs/VIRTUAL_TESTBED.md) — plan, manual preparation, definition/audit, offline snapshots, limitations.
+- [Daybreak security gate](docs/DAYBREAK_GATE.md) — source scanning and fixes come **before** any authorized live experimentation.
+- [Lab profile](lab/testbed.json) and [baseline receipt template](templates/baseline_receipt.json).
+
+Once a local, authorized installer ISO is available, inspect the zero-write plan with:
+
+    uv run --no-project python scripts/testbed.py plan --lab-root "$HOME/rhel-lab-state" --iso "$HOME/Downloads/RHEL-INSTALLER.iso"
+
+This command only produces an XML/JSON plan and performs no host mutation. Host-changing commands require separate explicit approval; no actual guest, security scan or isolated network proof has been performed.
 
 ## Research priorities
 
