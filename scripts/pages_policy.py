@@ -20,7 +20,10 @@ class PolicyError(ValueError):
 PUBLISH_MARKERS = (
     re.compile(r"\bactions/(?:deploy-pages|upload-pages-artifact)@", re.I),
     re.compile(r"\bpeaceiris/actions-gh-pages@", re.I),
-    re.compile(r"(?m)^\s*pages\s*:\s*write\b", re.I),
+    # Equivalent YAML permission mappings: block style (including quoted keys
+    # and values), plus flow style with a first or later map entry.
+    re.compile(r"""(?im)^[ \t]*["']?pages["']?[ \t]*:[ \t]*["']?write["']?(?=[ \t]*(?:#|$))"""),
+    re.compile(r"""(?i)[,{][ \t\r\n]*["']?pages["']?[ \t]*:[ \t]*["']?write["']?(?=[ \t]*(?:,|\}|#|$))"""),
     re.compile(r"\bgh-pages\b", re.I),
 )
 
