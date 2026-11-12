@@ -204,8 +204,31 @@ def audit_xml(xml: str, cfg: dict, root: Path, iso: Path) -> None:
         raise TestbedError("disk or ISO missing")
 
 
+def _diagnostic(value: str | bytes | None) -> str:
+    """Retain captured negative-result text across subprocess error types."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="backslashreplace")
+    return value
+
+
 def local_command(args: list[str], timeout: int = 30) -> str:
-    result = subprocess.run(args, check=True, timeout=timeout, capture_output=True, text=True)
+    try:
+        result = subprocess.run(args, check=True, timeout=timeout,
+                                capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        raise TestbedError(
+            f"{args[0]} returned exit status {exc.returncode}; "
+            f"captured stdout: {_diagnostic(exc.stdout)}; "
+            f"captured stderr: {_diagnostic(exc.stderr)}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TestbedError(
+            f"{args[0]} timed out after {exc.timeout}s; "
+            f"captured stdout: {_diagnostic(exc.stdout)}; "
+            f"captured stderr: {_diagnostic(exc.stderr)}"
+        ) from exc
     return result.stdout.strip()
 
 
