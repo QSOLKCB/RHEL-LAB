@@ -143,6 +143,44 @@ def audit_xml(xml: str, cfg: dict, root: Path, iso: Path) -> None:
     unexpected = {d.tag for d in devices} - allowed
     if unexpected:
         raise TestbedError(f"unexpected devices: {sorted(unexpected)}")
+    forbidden = {"interface", "graphics", "hostdev", "filesystem", "redirdev",
+                 "channel", "shmem", "smartcard", "tpm", "commandline"}
+    if any(node.tag in forbidden for node in domain.iter()):
+        raise TestbedError("network, passthrough, or command-line override present")
+    os_type = domain.find("os/type")
+    if os_type is None or os_type.get("arch") != "x86_64" or os_type.text != "hvm":
+        raise TestbedError("unexpected guest architecture or OS type")
+    vcpu = domain.findtext("vcpu")
+    if vcpu != str(cfg["vcpus"]):
+        raise TestbedError("vCPU count does not match the profile")
+    memory = domain.find("memory")
+    if memory is None:
+        raise TestbedError("missing memory configuration")
+    memory_bytes = cfg["memory_mib"] * 1024 * 1024
+    units = {"MiB": 1024 * 1024, "KiB": 1024}
+    if memory.get("unit") not in units or int(memory.text or "0") * units[memory.get("unit")] != memory_bytes:
+        raise TestbedError("memory allocation differs from the profile")
+    for port in devices.findall("serial") + devices.findall("console"):
+        if port.get("type") != "pty":
+            raise TestbedError("only local PTY serial/console devices are allowed")
+        if any(child.tag not in {"source", "target", "alias", "address"} for child in port):
+            raise TestbedError("unexpected serial/console attachment")
+        for source in port.findall("source"):
+            if set(source.attrib) != {"path"} or not re.fullmatch(r"/dev/pts/[0-9]+", source.get("path", "")):
+                raise TestbedError("unexpected PTY source path")
+    for item in devices.findall("input"):
+        if (item.get("type") not in {"mouse", "tablet", "keyboard"}
+                or item.get("bus") not in {None, "ps2", "usb", "virtio"}
+                or item.find("source") is not None):
+            raise TestbedError("host input passthrough is forbidden")
+    for item in devices.findall("video"):
+        if item.find(".//acceleration[@accel3d='yes']") is not None:
+            raise TestbedError("3D host GPU acceleration is forbidden")
+    emulator = devices.find("emulator")
+    if emulator is not None and emulator.text not in {
+        "/usr/bin/qemu-system-x86_64", "/usr/libexec/qemu-kvm"
+    }:
+        raise TestbedError("unapproved QEMU emulator executable")
     if any(b.get("dev") not in {"cdrom", "hd"} for b in domain.findall(".//boot")):
         raise TestbedError("non-disk or network boot is forbidden")
     expected = {"disk": (str(root / "disk.qcow2"), "qcow2"),
