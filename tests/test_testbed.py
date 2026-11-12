@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -128,6 +129,27 @@ class TestbedTests(unittest.TestCase):
             result = t.plan(self.cfg, self.root, self.iso)
         self.assertEqual(result["status"], "PLANNED_NOT_EXECUTED")
         self.assertFalse(self.root.exists())
+
+    def test_failed_subprocess_retains_stderr_and_stdout(self):
+        failure = subprocess.CalledProcessError(7, ["virsh", "domstate"],
+                                               output="partial output",
+                                               stderr="permission denied")
+        with patch.object(t.subprocess, "run", side_effect=failure):
+            with self.assertRaises(t.TestbedError) as caught:
+                t.local_command(["virsh", "domstate"])
+        self.assertIn("partial output", str(caught.exception))
+        self.assertIn("permission denied", str(caught.exception))
+        self.assertIn("exit status 7", str(caught.exception))
+
+    def test_timeout_preserves_partial_diagnostics(self):
+        failure = subprocess.TimeoutExpired(["qemu-img", "convert"], 3,
+                                           output=b"partial\\xff",
+                                           stderr=b"disk full")
+        with patch.object(t.subprocess, "run", side_effect=failure):
+            with self.assertRaises(t.TestbedError) as caught:
+                t.local_command(["qemu-img", "convert"])
+        self.assertIn("timed out", str(caught.exception))
+        self.assertIn("disk full", str(caught.exception))
 
     def test_prepare_requires_operator_approval(self):
         with self.assertRaises(t.TestbedError):
