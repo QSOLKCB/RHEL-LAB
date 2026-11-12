@@ -1,1 +1,1 @@
-# RHEL-LAB
+# RHEL-LABReproducible Red Hat Enterprise Linux reliability and security research: isolated VM testing, kernel stress tests, concurrency analysis, targeted fuzzing, formal evidence and responsible disclosure.
