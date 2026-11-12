@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import testbed as t
+from scripts import safe_fs
 
 
 class TestbedTests(unittest.TestCase):
@@ -157,7 +158,7 @@ class TestbedTests(unittest.TestCase):
         self.assertFalse(self.root.exists())
 
     def test_prepare_never_defines_or_boots_vm(self):
-        def fake_qemu(args, timeout=30):
+        def fake_qemu(args, timeout=30, pass_fds=()):
             self.assertEqual(args[:4], ["qemu-img", "create", "-f", "qcow2"])
             Path(args[4]).write_bytes(b"simulated image")
             return ""
@@ -200,6 +201,74 @@ class TestbedTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("--inactive", calls[0])
         self.assertNotIn("--inactive", calls[1])
+
+
+    def test_untrusted_parent_writable_by_other_users_is_refused(self):
+        shared = self.base / "shared"
+        shared.mkdir(mode=0o700)
+        shared.chmod(0o777)
+        with self.assertRaises(safe_fs.UnsafePath):
+            t.state_dir(str(shared / "rhel-lab-attacker"), must_exist=False)
+
+    def test_prepare_pins_created_directory_across_parent_swap(self):
+        moved = self.base / "moved"
+        attacker = self.base / "outside"
+        attacker.mkdir(mode=0o700)
+
+        def raced_qemu(args, timeout=30, pass_fds=()):
+            self.assertEqual(args[:4], ["qemu-img", "create", "-f", "qcow2"])
+            self.assertEqual(len(pass_fds), 1)
+            self.root.rename(moved)
+            self.root.symlink_to(attacker, target_is_directory=True)
+            Path(args[4]).write_bytes(b"simulated image")
+            return ""
+
+        with patch.object(t, "need"), patch.object(t, "local_command",
+                                                side_effect=raced_qemu):
+            t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
+        self.assertTrue((moved / "domain.xml").is_file())
+        self.assertTrue((moved / "disk.qcow2").is_file())
+        self.assertFalse((attacker / "domain.xml").exists())
+        self.assertFalse((attacker / "disk.qcow2").exists())
+
+    def test_snapshot_source_symlink_is_refused(self):
+        self.root.mkdir(mode=0o700)
+        outside = self.base / "outside.qcow2"
+        outside.write_bytes(b"secret")
+        (self.root / "disk.qcow2").symlink_to(outside)
+        with patch.object(t, "need"):
+            with self.assertRaises(OSError):
+                t.snapshot(self.cfg, self.root, self.iso, "baseline", "a" * 40,
+                           t.SNAPSHOT_TOKEN)
+
+    def test_offline_snapshot_receipt_is_private(self):
+        self.root.mkdir(mode=0o700)
+        (self.root / "disk.qcow2").write_bytes(b"fake disk")
+
+        def fake_command(args, timeout=30, pass_fds=()):
+            if args[:2] == ["virsh", "-c"]:
+                return "shut off"
+            if args[:2] == ["qemu-img", "info"]:
+                self.assertTrue(pass_fds)
+                return '{"format":"qcow2"}'
+            if args[:2] == ["qemu-img", "convert"]:
+                self.assertEqual(len(pass_fds), 2)
+                Path(args[-1]).write_bytes(b"converted evidence")
+                return ""
+            self.fail(f"unexpected command: {args}")
+
+        with patch.object(t, "need"), patch.object(t, "audit_defined"), \
+             patch.object(t, "local_command", side_effect=fake_command):
+            result = t.snapshot(self.cfg, self.root, self.iso, "baseline",
+                                "a" * 40, t.SNAPSHOT_TOKEN)
+        receipt = Path(result["receipt"])
+        image = Path(result["image"])
+        self.assertTrue(image.is_file())
+        self.assertEqual(image.read_bytes(), b"converted evidence")
+        self.assertEqual(os.stat(receipt).st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(receipt.read_text())["sha256"], result["sha256"])
+        self.assertEqual(json.loads(receipt.read_text())["claim"], "OFFLINE_DISK_COPY_ONLY")
+
 
 
 if __name__ == "__main__":

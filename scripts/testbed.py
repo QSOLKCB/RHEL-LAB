@@ -16,6 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+try:
+    from . import safe_fs
+except ImportError:  # direct invocation
+    import safe_fs
+
 SCHEMA = "qsol-rhel-testbed/v1"
 REPO = Path(__file__).resolve().parent.parent
 URI = "qemu:///session"
@@ -64,23 +69,22 @@ def absolute_path(text: str) -> Path:
     for entry in (path, *path.parents):
         if entry.is_symlink():
             raise TestbedError(f"symlink in host path: {entry}")
-    return path.resolve(strict=False)
+    return path
 
 
 def state_dir(text: str, *, must_exist: bool = False) -> Path:
+    """Validate trusted ancestors; mutating operations later pin their own FDs."""
     root = absolute_path(text)
     if root == REPO or REPO in root.parents:
         raise TestbedError("state must live outside the Git repository")
+    # This closes the lower-trust ancestor boundary even when the root is absent.
+    with safe_fs.directory(root.parent):
+        pass
     if root.exists():
-        if not root.is_dir():
-            raise TestbedError("state path is not a directory")
-        info = root.stat()
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
-            raise TestbedError("state directory must be user-owned and mode 0700")
+        with safe_fs.lab_directory(root):
+            pass
     elif must_exist:
         raise TestbedError("state directory not prepared")
-    elif not root.parent.is_dir():
-        raise TestbedError("state directory parent must already exist")
     return root
 
 
@@ -213,10 +217,11 @@ def _diagnostic(value: str | bytes | None) -> str:
     return value
 
 
-def local_command(args: list[str], timeout: int = 30) -> str:
+def local_command(args: list[str], timeout: int = 30,
+                  *, pass_fds: tuple[int, ...] = ()) -> str:
     try:
         result = subprocess.run(args, check=True, timeout=timeout,
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, pass_fds=pass_fds)
     except subprocess.CalledProcessError as exc:
         raise TestbedError(
             f"{args[0]} returned exit status {exc.returncode}; "
@@ -256,19 +261,27 @@ def prepare(cfg: dict, root: Path, iso: Path, token: str | None) -> dict:
     need("qemu-img")
     disk, definition = paths(root)
     xml = render_xml(cfg, root, iso)
-    if any(path.exists() or path.is_symlink() for path in (disk, definition)):
-        raise TestbedError("refusing to replace existing disk/XML")
-    if not root.exists():
-        root.mkdir(mode=0o700)
-    old_umask = os.umask(0o077)
-    try:
-        local_command(["qemu-img", "create", "-f", "qcow2",
-                       str(disk), f"{cfg['disk_gib']}G"], timeout=120)
-        fd = os.open(definition, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    # Keep an operator-owned, private lab FD open across all host mutations.
+    # qemu-img receives an inherited FD, never a mutable ancestor pathname.
+    with safe_fs.lab_directory(root, create=True) as lab_fd:
+        if any(safe_fs.exists_at(lab_fd, name)
+               for name in ("disk.qcow2", "domain.xml")):
+            raise TestbedError("refusing to replace existing disk/XML")
+        disk_fd = os.open("disk.qcow2",
+                          safe_fs.FILE_RDWR_CREATE_FLAGS,
+                          0o600, dir_fd=lab_fd)
+        try:
+            local_command(["qemu-img", "create", "-f", "qcow2",
+                           f"/proc/self/fd/{disk_fd}", f"{cfg['disk_gib']}G"],
+                          timeout=120, pass_fds=(disk_fd,))
+        finally:
+            os.close(disk_fd)
+        fd = os.open("domain.xml", safe_fs.FILE_WRITE_FLAGS, 0o600,
+                     dir_fd=lab_fd)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(xml)
-    finally:
-        os.umask(old_umask)
+            stream.flush()
+            os.fsync(stream.fileno())
     return {"status": "PREPARED_NOT_DEFINED_OR_BOOTED",
             "definition": str(definition), "disk": str(disk),
             "manual_next": f"virsh -c {URI} define {definition}"}
@@ -284,14 +297,24 @@ def audit_defined(cfg: dict, root: Path, iso: Path) -> dict:
             "limitation": "Does not prove host egress isolation or prevent races."}
 
 
-def hash_file(path: Path) -> tuple[str, int]:
+def hash_fd(fd: int) -> tuple[str, int]:
+    """Hash a stable, already opened regular descriptor."""
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise TestbedError("snapshot output is not a regular file")
+    os.lseek(fd, 0, os.SEEK_SET)
     digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-            size += len(block)
-    return digest.hexdigest(), size
+    count = 0
+    for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
+        digest.update(chunk)
+        count += len(chunk)
+    after = os.fstat(fd)
+    if ((before.st_dev, before.st_ino, before.st_size,
+         before.st_mtime_ns, before.st_ctime_ns)
+        != (after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns) or count != after.st_size):
+        raise TestbedError("snapshot image changed during hashing")
+    return digest.hexdigest(), count
 
 
 def snapshot(cfg: dict, root: Path, iso: Path, label: str, sha: str,
@@ -300,48 +323,70 @@ def snapshot(cfg: dict, root: Path, iso: Path, label: str, sha: str,
     if LABEL.fullmatch(label) is None or SHA.fullmatch(sha) is None:
         raise TestbedError("invalid snapshot label or exact Git commit SHA")
     need("qemu-img")
-    disk, _ = paths(root)
-    if disk.is_symlink() or not disk.is_file():
-        raise TestbedError("local disk absent or symlinked")
-    folder = root / "snapshots"
-    if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
-        raise TestbedError("snapshots directory is unsafe")
-    dest = folder / f"{label}.qcow2"
-    receipt = folder / f"{label}.receipt.json"
-    if any(p.exists() or p.is_symlink() for p in (dest, receipt)):
-        raise TestbedError("snapshot or receipt already exists")
-    audit_defined(cfg, root, iso)
-    state = local_command(["virsh", "-c", URI, "domstate", cfg["name"]])
-    if state != "shut off":
-        raise TestbedError(f"domain is not shut off: {state}")
-    metadata = json.loads(local_command(["qemu-img", "info", "--output=json", str(disk)]))
-    if metadata.get("format") != "qcow2" or metadata.get("backing-filename"):
-        raise TestbedError("only standalone QCOW2 images are supported")
-    if not folder.exists():
-        folder.mkdir(mode=0o700)
-    temporary = folder / f".pending-{secrets.token_hex(16)}.qcow2"
-    if temporary.exists():
-        raise TestbedError("temporary snapshot name collision")
-    # QEMU warns against processing disks being used by another process.
-    local_command(["qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
-                   str(disk), str(temporary)], timeout=3600)
-    if temporary.is_symlink() or not temporary.is_file():
-        raise TestbedError("conversion did not produce a regular disk image")
-    digest, size = hash_file(temporary)
-    os.link(temporary, dest)  # atomic no-clobber publication
-    temporary.unlink()
-    report = {
-        "schema": "qsol-rhel-snapshot/v1", "domain": cfg["name"],
-        "label": label, "source_commit": sha, "sha256": digest,
-        "bytes": size, "captured_utc": datetime.now(timezone.utc).isoformat(),
-        "claim": "OFFLINE_DISK_COPY_ONLY",
-        "limitation": "No guarantee against another process starting/writing this VM.",
-    }
-    with receipt.open("x", encoding="utf-8") as stream:
-        json.dump(report, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-    return {"status": "SNAPSHOT_CREATED", "image": str(dest),
-            "receipt": str(receipt), "sha256": digest}
+    with safe_fs.lab_directory(root) as lab_fd:
+        source_fd = safe_fs.regular_at(lab_fd, "disk.qcow2")
+        try:
+            audit_defined(cfg, root, iso)
+            state = local_command(["virsh", "-c", URI, "domstate", cfg["name"]])
+            if state != "shut off":
+                raise TestbedError(f"domain is not shut off: {state}")
+            source_path = f"/proc/self/fd/{source_fd}"
+            metadata = json.loads(local_command(
+                ["qemu-img", "info", "--output=json", source_path],
+                pass_fds=(source_fd,)))
+            if metadata.get("format") != "qcow2" or metadata.get("backing-filename"):
+                raise TestbedError("only standalone QCOW2 images are supported")
+            source_before = os.fstat(source_fd)
+            with safe_fs.private_child_directory(lab_fd, "snapshots",
+                                                 create=True) as snapshot_fd:
+                destination = f"{label}.qcow2"
+                receipt_name = f"{label}.receipt.json"
+                if (safe_fs.exists_at(snapshot_fd, destination)
+                        or safe_fs.exists_at(snapshot_fd, receipt_name)):
+                    raise TestbedError("snapshot or receipt already exists")
+                temporary = f".pending-{secrets.token_hex(16)}.qcow2"
+                temp_fd = os.open(temporary, safe_fs.FILE_RDWR_CREATE_FLAGS,
+                                  0o600, dir_fd=snapshot_fd)
+                published = False
+                try:
+                    local_command(["qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
+                                   source_path, f"/proc/self/fd/{temp_fd}"],
+                                  timeout=3600, pass_fds=(source_fd, temp_fd))
+                    source_after = os.fstat(source_fd)
+                    if ((source_before.st_size, source_before.st_mtime_ns, source_before.st_ctime_ns)
+                         != (source_after.st_size, source_after.st_mtime_ns, source_after.st_ctime_ns)):
+                        raise TestbedError("source disk changed during offline copy")
+                    digest, size = hash_fd(temp_fd)
+                    report = {
+                        "schema": "qsol-rhel-snapshot/v1", "domain": cfg["name"],
+                        "label": label, "source_commit": sha, "sha256": digest,
+                        "bytes": size, "captured_utc": datetime.now(timezone.utc).isoformat(),
+                        "claim": "OFFLINE_DISK_COPY_ONLY",
+                        "limitation": "A non-cooperating writer may still change guest state.",
+                    }
+                    os.link(temporary, destination, src_dir_fd=snapshot_fd,
+                            dst_dir_fd=snapshot_fd, follow_symlinks=False)
+                    published = True
+                    fd = os.open(receipt_name, safe_fs.FILE_WRITE_FLAGS,
+                                 0o600, dir_fd=snapshot_fd)
+                    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                        json.dump(report, stream, indent=2, sort_keys=True)
+                        stream.write("\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                except Exception:
+                    if published:
+                        os.unlink(destination, dir_fd=snapshot_fd)
+                    raise
+                finally:
+                    os.close(temp_fd)
+                    os.unlink(temporary, dir_fd=snapshot_fd)
+        finally:
+            os.close(source_fd)
+    return {"status": "SNAPSHOT_CREATED",
+            "image": str(root / "snapshots" / f"{label}.qcow2"),
+            "receipt": str(root / "snapshots" / f"{label}.receipt.json"),
+            "sha256": digest}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -370,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
             report = audit_defined(cfg, root, iso)
         else:
             report = snapshot(cfg, root, iso, args.label, args.source_sha, args.approve)
-    except (TestbedError, OSError, ValueError, subprocess.SubprocessError, ET.ParseError) as exc:
+    except (TestbedError, safe_fs.UnsafePath, OSError, ValueError, subprocess.SubprocessError, ET.ParseError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(report, sort_keys=True, indent=2))

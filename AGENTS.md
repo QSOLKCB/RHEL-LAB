@@ -18,6 +18,8 @@ Develop inspectable, reproducible, **defensive** reliability and security resear
 ## Local testbed gate
 
 - Never enable GitHub Pages, publish a project URL/dashboard, or add a hosted endpoint for this repository.
+- Pin trusted host directory/file descriptors for any state-changing VM or evidence operation. Refuse group/other-writable ancestors, unexpected symlinks, and public evidence directories; no path-based revalidation after a slow process call.
+- Evidence sealing and verification require a quiescent or externally snapshotted input; SHA-256 does not prove point-in-time consistency against malicious simultaneous writers.
 - Keep guest networking disabled by default. No NIC, NAT, bridge, public graphics or host passthrough without separate explicit scope review.
 - Never run scripts/testbed.py prepare or snapshot, virsh define/start, or any other state-changing host step without operator approval. GitHub CI must only test pure/mocked code.
 - Do not represent a successful static XML audit as proof of real network containment or a completed RHEL experiment.

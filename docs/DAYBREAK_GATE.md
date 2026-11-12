@@ -1,6 +1,6 @@
 # Daybreak Defense Factory — staged security gate
 
-**Status: NOT RUN.** RHEL-LAB-002 code should be reviewed through an ordinary GitHub PR and the non-privileged Python CI tests *before* requesting a Daybreak repository scan. Daybreak has not been authorized to run a scan by this milestone.
+**Status: TWO SOURCE AUDITS COMPLETED, FINDINGS UNDER REMEDIATION.** Daybreak scanned RHEL-LAB at commit `889248b59e4e2cb7c06d8a635c0a07cb2cd39c1e` in runs `wfr_2ef0982c13d785cbdfbf9ecc157a3ccc863cb4085e09dcd70e9124f86bae68f2` and `wfr_f166c5a69c210c6a14bdb64c37311e11fffd8e8dd8a0e0e5e0bd0e0dfb0cac99`. Eight repository-source findings (three medium, five low) are being addressed. Neither a completed audit nor a green CI workflow proves a live RHEL guest is safe; **no RHEL experiments have been executed**.
 
 ## Controlled progression
 
