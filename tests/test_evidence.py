@@ -49,7 +49,7 @@ class EvidenceTests(unittest.TestCase):
             verify(self.data, self.manifest)
 
     def test_output_inside_input_fails(self) -> None:
-        with self.assertRaises(EvidenceError):
+        with self.assertRaises(UnsafePath):
             seal(self.data, self.data / "manifest.json")
 
     def test_existing_manifest_is_not_overwritten(self) -> None:
@@ -66,7 +66,7 @@ class EvidenceTests(unittest.TestCase):
     def test_symlinked_root_is_rejected(self) -> None:
         alias = self.base / "alias"
         alias.symlink_to(self.data, target_is_directory=True)
-        with self.assertRaises(EvidenceError):
+        with self.assertRaises(NotADirectoryError):
             inventory(alias)
 
     def test_modified_manifest_fails(self) -> None:
