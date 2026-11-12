@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.evidence import EvidenceError, inventory, seal, verify
 
@@ -79,6 +81,55 @@ class EvidenceTests(unittest.TestCase):
         (nested / "proof.bin").write_bytes(b"\x00\x01")
         self.assertEqual(inventory(self.data)["files"][-1]["path"], "z.log")
         self.assertIn("sub/proof.bin", [f["path"] for f in inventory(self.data)["files"]])
+
+
+    def test_unreadable_subdirectory_blocks_seal(self) -> None:
+        blocked = self.data / "blocked"
+        blocked.mkdir()
+        (blocked / "evidence.log").write_bytes(b"secret\\n")
+        real_scandir = os.scandir
+
+        def deny(path):
+            if Path(path) == blocked:
+                raise PermissionError(f"cannot enumerate {path}")
+            return real_scandir(path)
+
+        with patch("scripts.evidence.os.scandir", side_effect=deny):
+            with self.assertRaises(PermissionError):
+                seal(self.data, self.manifest)
+        self.assertFalse(self.manifest.exists())
+
+    def test_unreadable_subdirectory_blocks_verify(self) -> None:
+        blocked = self.data / "blocked"
+        blocked.mkdir()
+        evidence = blocked / "evidence.log"
+        evidence.write_bytes(b"original\\n")
+        seal(self.data, self.manifest)
+        evidence.write_bytes(b"modified\\n")
+        real_scandir = os.scandir
+
+        def deny(path):
+            if Path(path) == blocked:
+                raise PermissionError(f"cannot enumerate {path}")
+            return real_scandir(path)
+
+        with patch("scripts.evidence.os.scandir", side_effect=deny):
+            with self.assertRaises(PermissionError):
+                verify(self.data, self.manifest)
+
+    def test_root_enumeration_error_is_not_suppressed(self) -> None:
+        with patch("scripts.evidence.os.scandir", side_effect=PermissionError("root blocked")):
+            with self.assertRaises(PermissionError):
+                inventory(self.data)
+
+    def test_symlinked_directory_is_rejected(self) -> None:
+        nested = self.data / "nested"
+        nested.mkdir()
+        (nested / "proof.bin").write_bytes(b"proof")
+        (self.data / "alias").symlink_to(nested, target_is_directory=True)
+        with self.assertRaises(EvidenceError):
+            inventory(self.data)
+
 
 
 if __name__ == "__main__":
