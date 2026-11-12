@@ -8,7 +8,7 @@ This milestone supplies an offline-first *host-side implementation*, not a prein
 - One x86_64 guest, 2 vCPUs, 4096 MiB RAM, standalone 48 GiB QCOW2 virtual disk. Configuration is in lab/testbed.json.
 - **No guest NIC, bridge, NAT, hostdev, host share, USB redirection, graphics listener or public service** in the generated domain XML.
 - Serial PTY console only. Guest ISO must be obtained separately from authorized Red Hat distribution; no proprietary image is committed.
-- Images, private receipts and XML live in an operator-selected private 0700 directory **outside the Git repository**.
+- Images, private receipts and XML live in a pinned, operator-owned 0700 directory under trusted ancestors **outside the Git repository**.
 - Every host-changing command is explicit, opt-in, and fail-closed. No automatic boot, package installation, VM definition, snapshot restore, or host network configuration.
 - A definition/active XML audit rejects unexpected disks, device passthrough, guest networking and external graphics. **This is a configuration audit, not proof of effective egress isolation.**
 - No GitHub Pages, public dashboard or network endpoint.
@@ -17,7 +17,7 @@ This milestone supplies an offline-first *host-side implementation*, not a prein
 
 Use a personally controlled Linux host with KVM support and local libvirt/QEMU tools installed by the operator according to their OS instructions. You need virsh, qemu-img, a working per-user qemu:///session connection, access to /dev/kvm and sufficient disk space. Do not install packages automatically as part of CI or this project.
 
-Check the actual hardware, hypervisor, firmware support, host ownership, VM resource budget, filesystem permissions and guest media authenticity yourself. The scripted plan **does not** check that a physical host is isolated.
+Check the actual hardware, hypervisor, firmware support, host ownership, VM resource budget, filesystem permissions and guest media authenticity yourself. The lab-root parent and ancestors must be root/operator-owned and not group/other writable (the root-owned sticky /tmp convention is recognized); a new lab root is created 0700. Avoid shared mountpoints. The scripted plan **does not** check that a physical host is isolated.
 
 Download the correct RHEL installer ISO using your own authorized account, verify its official checksum/signature, and keep it outside Git. No vendor access credential belongs in a script, PR or public log.
 
@@ -76,7 +76,7 @@ The snapshot command:
 4. Refuses existing destination/receipt names and uses a no-clobber hard-link for final publication.
 5. Records SHA-256, exact source commit, byte count and UTC time in a local receipt.
 
-This is an **offline disk copy**, not a libvirt RAM-state snapshot and not a guaranteed atomic capture against hostile/concurrent writers. Never use qemu-img against a running VM disk.
+This is an **offline disk copy**, not a libvirt RAM-state snapshot and not a guaranteed atomic capture against hostile/concurrent writers. The operation now pins trusted directory and file descriptors, pre-creates output with exclusive owner-only permissions and invokes qemu-img through inherited Linux /proc/self/fd handles; `/proc` must be available. A non-cooperating writer with the operator's identity or a live guest can still invalidate a snapshot. Never use qemu-img against a running VM disk.
 
 Verify the resulting evidence directory using scripts/evidence.py, storing its manifest outside the directory being sealed. Preserve guest kernel, release, package versions, original media checksum, VM settings, snapshot identifiers, command line, exit status and negative findings in a separate private baseline receipt.
 

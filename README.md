@@ -44,7 +44,7 @@ To inventory an evidence directory, write the manifest **outside** the evidence 
     uv run --no-project python scripts/evidence.py seal --input ./local/capture-001 --output ./local/capture-001.manifest.json
     uv run --no-project python scripts/evidence.py verify --input ./local/capture-001 --manifest ./local/capture-001.manifest.json
 
-The example requires the capture directory to exist. The manifest is deterministic (no generated timestamp), records relative paths, byte sizes and SHA-256 digests, rejects symlinks, and will not overwrite an existing manifest. For provenance, separately record target/kernel/package versions, test configuration, seed, exact source SHA, time, tool versions, and whether the test actually executed. A manifest establishes byte identity, not scientific validity.
+The example requires the capture directory to exist. The manifest is deterministic (no generated timestamp), records relative paths, byte sizes and SHA-256 digests, rejects symlinks, and will not overwrite an existing manifest. Its output directory must be operator-owned and private (0700); it writes the manifest as 0600 using pinned directory descriptors. Seal only a quiescent or externally snapshotted evidence tree: per-file race checks cannot guarantee a global point-in-time view. For provenance, separately record target/kernel/package versions, test configuration, seed, exact source SHA, time, tool versions, and whether the test actually executed. A manifest establishes byte identity, not scientific validity.
 
 ## Virtual testbed (RHEL-LAB-002)
 
