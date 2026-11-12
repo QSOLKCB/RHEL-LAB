@@ -1,1 +1,60 @@
-# RHEL-LABReproducible Red Hat Enterprise Linux reliability and security research: isolated VM testing, kernel stress tests, concurrency analysis, targeted fuzzing, formal evidence and responsible disclosure.
+# QSOL-IMC RHEL-LAB
+
+**Reproducible Red Hat Enterprise Linux reliability and security research.**
+
+RHEL-LAB is an Apache-2.0-licensed research workspace for controlled experiments on RHEL installations in isolated virtual machines running on owned or explicitly authorized hardware. The project prioritizes exact provenance, independently repeatable results, and responsible disclosure.
+
+> Status: RHEL-LAB-001 foundation. This repository does not contain a tested RHEL VM image, demonstrated vulnerability, or completed kernel-fuzzing campaign.
+
+## Research boundaries
+
+- Run experiments only on owned or explicitly authorized lab systems. No Red Hat-hosted services, third-party targets, or production infrastructure.
+- Treat a developer subscription as product access, **not** authorization to probe Red Hat infrastructure.
+- Do not run kernel fuzzers, elevated stress tests, exploit demonstrations, or external scans in GitHub Actions.
+- Keep guest VM disk images, crash dumps, tokens, personally identifiable information, and unpublished security findings out of public commits.
+- Report potentially security-sensitive findings privately through the vendor's designated security channel; follow coordinated disclosure.
+
+See [AGENTS.md](AGENTS.md), [SECURITY.md](SECURITY.md), and [docs/RESEARCH_PROTOCOL.md](docs/RESEARCH_PROTOCOL.md) before performing experiments.
+
+## Repository map
+
+| Path | Purpose |
+| --- | --- |
+| AGENTS.md | Binding instructions for automated contributors |
+| docs/LAB_SETUP.md | Isolation and local lab prerequisites |
+| docs/RESEARCH_PROTOCOL.md | Experiment gates, provenance, disclosure |
+| docs/ROADMAP.md | Phased milestones and acceptance criteria |
+| scripts/evidence.py | Dependency-free SHA-256 evidence inventory and verifier |
+| tests/ | Safe standard-library unit tests |
+| .github/workflows/ci.yml | Non-privileged source checks only |
+
+## Quick start
+
+Requires Python 3.11 or newer. No third-party Python packages are needed. The commands below test the evidence tooling; **they do not install RHEL or execute security tests**.
+
+    uv run --no-project python -m unittest discover -s tests -v
+
+Alternatively:
+
+    python3 -m unittest discover -s tests -v
+
+To inventory an evidence directory, write the manifest **outside** the evidence directory:
+
+    uv run --no-project python scripts/evidence.py seal --input ./local/capture-001 --output ./local/capture-001.manifest.json
+    uv run --no-project python scripts/evidence.py verify --input ./local/capture-001 --manifest ./local/capture-001.manifest.json
+
+The example requires the capture directory to exist. The manifest is deterministic (no generated timestamp), records relative paths, byte sizes and SHA-256 digests, rejects symlinks, and will not overwrite an existing manifest. For provenance, separately record target/kernel/package versions, test configuration, seed, exact source SHA, time, tool versions, and whether the test actually executed. A manifest establishes byte identity, not scientific validity.
+
+## Research priorities
+
+1. Establish isolated, disposable RHEL guests and capture exact environment baselines.
+2. Establish reproducible baseline reliability tests, with explicit operator approval.
+3. Investigate bounded concurrency, stress, and kernel self-test campaigns.
+4. Conduct targeted fuzzing only after the scope and containment gates pass.
+5. Independently reproduce findings, preserve negative results, and disclose security issues privately before public discussion.
+
+## Licence and attribution
+
+Copyright 2026 QSOL-IMC contributors. Licensed under the [Apache License, Version 2.0](LICENSE).
+
+RHEL and Red Hat are trademarks of Red Hat, Inc. This is independent research; no endorsement, vendor authorization for off-lab testing, or affiliation is implied.
