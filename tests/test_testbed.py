@@ -69,6 +69,36 @@ class TestbedTests(unittest.TestCase):
         with self.assertRaises(t.TestbedError):
             t.audit_xml(xml, self.cfg, self.root, self.iso)
 
+    def test_tcp_serial_listener_rejected(self):
+        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = xml.replace('<serial type="pty">', '<serial type="tcp">')
+        with self.assertRaises(t.TestbedError):
+            t.audit_xml(xml, self.cfg, self.root, self.iso)
+
+    def test_input_passthrough_rejected(self):
+        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = xml.replace("</devices>", '<input type="passthrough" bus="virtio" /></devices>')
+        with self.assertRaises(t.TestbedError):
+            t.audit_xml(xml, self.cfg, self.root, self.iso)
+
+    def test_unapproved_emulator_rejected(self):
+        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = xml.replace("</devices>", "<emulator>/tmp/untrusted-qemu</emulator></devices>")
+        with self.assertRaises(t.TestbedError):
+            t.audit_xml(xml, self.cfg, self.root, self.iso)
+
+    def test_changed_resource_limits_rejected(self):
+        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = xml.replace("<vcpu>2</vcpu>", "<vcpu>32</vcpu>")
+        with self.assertRaises(t.TestbedError):
+            t.audit_xml(xml, self.cfg, self.root, self.iso)
+
+    def test_libvirt_kib_memory_normalization_allowed(self):
+        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = xml.replace('<memory unit="MiB">4096</memory>',
+                          '<memory unit="KiB">4194304</memory>')
+        t.audit_xml(xml, self.cfg, self.root, self.iso)
+
     def test_file_path_substitution_rejected(self):
         xml = t.render_xml(self.cfg, self.root, self.iso)
         xml = xml.replace(str(self.root / "disk.qcow2"), "/tmp/other.qcow2")
