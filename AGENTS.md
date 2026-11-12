@@ -15,6 +15,14 @@ Develop inspectable, reproducible, **defensive** reliability and security resear
 5. Use an isolated guest network without bridged access by default; never assume virtualization alone prevents egress. Validate containment before every experimental campaign.
 6. On unexpected access, sensitive data exposure, or scope drift: stop execution, preserve minimal evidence securely, and escalate to the owner.
 
+## Local testbed gate
+
+- Never enable GitHub Pages, publish a project URL/dashboard, or add a hosted endpoint for this repository.
+- Keep guest networking disabled by default. No NIC, NAT, bridge, public graphics or host passthrough without separate explicit scope review.
+- Never run scripts/testbed.py prepare or snapshot, virsh define/start, or any other state-changing host step without operator approval. GitHub CI must only test pure/mocked code.
+- Do not represent a successful static XML audit as proof of real network containment or a completed RHEL experiment.
+- Stage Daybreak repository code reviews separately. No scans or automated fixes are authorized merely by creating this PR.
+
 ## Engineering defaults
 
 - Prefer Python standard library; use uv run --no-project for standalone scripts. If dependency management is truly needed, use uv add and uv lock with explicit versions.

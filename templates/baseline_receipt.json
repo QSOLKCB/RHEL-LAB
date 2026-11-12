@@ -1,0 +1,24 @@
+{
+  "schema": "qsol-rhel-baseline/v1",
+  "evidence_class": "PLANNED",
+  "authorization_reference": null,
+  "test_scope": null,
+  "host_configuration": null,
+  "libvirt_connection": "qemu:///session",
+  "vm_name": "rhel-lab-offline-01",
+  "iso_sha256": null,
+  "rhel_release": null,
+  "kernel_release": null,
+  "installed_package_versions": null,
+  "guest_network_verification": null,
+  "guest_snapshot_sha256": null,
+  "repository_commit_sha": null,
+  "operator": null,
+  "collected_utc": null,
+  "commands_and_exit_codes": [],
+  "observations": [],
+  "negative_results": [],
+  "limitations": [
+    "Template only. No guest has been created, tested, or independently verified."
+  ]
+}

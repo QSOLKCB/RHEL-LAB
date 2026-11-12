@@ -6,14 +6,20 @@
 - [x] Document lab containment, experiment protocol and security disclosure.
 - [x] Supply deterministic, standard-library SHA-256 evidence inventory and verification.
 - [x] Supply safe unit tests and CI without guest workloads.
-- [ ] Owner review and merge; CI status to be verified separately.
+- [x] Owner reviewed and merged RHEL-LAB-001; CI verified green on the merge commit.
 
-## RHEL-LAB-002 — authorized guest baseline
+## RHEL-LAB-002 — The Virtual Testbed
 
-- [ ] Select exact RHEL release and validate subscription/installation terms.
-- [ ] Document actual hypervisor and guest configurations.
-- [ ] Record signed-off VM scope, offline networking checks, exact package/kernel baseline.
-- [ ] Create reproducible snapshot and artifact receipts.
+- [x] Provide a strictly offline-only x86_64 KVM profile and serial-console-only libvirt domain XML.
+- [x] Add no-write plan, approved disk preparation, persistent/live XML inspection and guarded offline snapshot commands.
+- [x] Add a baseline receipt template, documented containment checklist, regression tests and Daybreak scan gate.
+- [ ] Owner review, CI validation and security audit of this PR.
+- [ ] Select/download exact RHEL ISO under valid entitlement and verify media integrity.
+- [ ] Confirm actual host KVM/libvirt capability and security settings; record authorized VM scope.
+- [ ] Manually define/install the isolated guest after authorization; verify *actual* network and host isolation.
+- [ ] Capture a real clean baseline snapshot with exact guest/kernel/package evidence.
+
+Source tooling completion is not equivalent to guest installation, execution, isolation proof or a completed Daybreak scan.
 
 ## RHEL-LAB-003 — bounded reliability campaign
 

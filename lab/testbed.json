@@ -1,0 +1,9 @@
+{
+  "schema": "qsol-rhel-testbed/v1",
+  "name": "rhel-lab-offline-01",
+  "architecture": "x86_64",
+  "network": "none",
+  "vcpus": 2,
+  "memory_mib": 4096,
+  "disk_gib": 48
+}
