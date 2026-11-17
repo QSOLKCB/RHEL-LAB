@@ -1,25 +1,25 @@
 # Daybreak Defense Factory — staged security gate
 
-**Status: TWO SOURCE AUDITS COMPLETED, FINDINGS UNDER REMEDIATION.** Daybreak scanned RHEL-LAB at commit `889248b59e4e2cb7c06d8a635c0a07cb2cd39c1e` in runs `wfr_2ef0982c13d785cbdfbf9ecc157a3ccc863cb4085e09dcd70e9124f86bae68f2` and `wfr_f166c5a69c210c6a14bdb64c37311e11fffd8e8dd8a0e0e5e0bd0e0dfb0cac99`. Eight repository-source findings (three medium, five low) are being addressed. Neither a completed audit nor a green CI workflow proves a live RHEL guest is safe; **no RHEL experiments have been executed**.
+**Status (2026-11-18): NOT CLEARED FOR LIVE RHEL EXPERIMENTS.** Six completed Daybreak repository scans were recorded. The newest completed scan (`wfr_bb281a48fdcfd85b076cd03dbb76b1ecd3761596b0b9d050c7bbf7947f6ac311`) targeted `4d4827af3aad0fcd4fafec891dc8e02a8c6d0215`, not the then-current main `dabb6a29304f99e403b6dbb1154983dacde3cc6d` or the new draft PRs. A green CI run is not proof of host isolation.
 
-## Controlled progression
+## Reconciled observations
 
-1. Review all changes, particularly the local command boundaries, operator approval tokens, XML allowlist, disk paths, and snapshot race limitations.
-2. Check CI for the exact PR head SHA. Unit tests prove only the Python utilities' tested behaviors, not RHEL kernel behavior.
-3. Request a **repository source-code security scan** through Daybreak when the owner approves it; use the connected QSOLKCB/RHEL-LAB repository and inspect findings.
-4. Fix validated source-code findings on a new feature branch, reproduce reported problems, add regression tests and repeat CI/reviews. No automatic merging.
-5. Approve and merge only after review gates pass.
-6. Separately prepare/verify a local KVM guest, isolation, permitted licensing, disk capacity and offline access. The owner explicitly authorizes any actual host operation.
-7. Only after those gates approve guest startup, local reliability experiments or other active testing. No Red Hat service/third-party probing.
+- `acf_2e6e3a40f0a8fc363ee8f78eee67566f`: evidence-tree traversal could consume resources before limiting file count or hashing. Draft PR #17 applies the saved bounded-work fix. Merged PR #14 concerned **manifest decoding**, a different boundary.
+- The Pages status check currently runs candidate-controlled code. A required independent check must execute a trusted-base validator, not scripts checked out from the PR.
+- `acf_3358dca947560d3c7aa45a5db7845a61`: prior PATH-helper issue already has pinned trusted helpers; PR #13 was closed without merging as obsolete. Do not reapply that fix.
+- The audit additionally found a blocking unprotected main branch, ISO and snapshot storage-budget gaps, QCOW2 external-file/header inspection gaps, unbounded subprocess capture, and FIFO config reads. Draft PR #16 addresses the config boundary only.
 
-**Important distinction:** Daybreak scans repository source code. It is not a substitute for inspecting real guest firewall rules, proving isolation, running kernel fuzzing or observing a live RHEL VM. No GitHub Actions job may start a guest or conduct privileged/security testing.
+## Mandatory gates before any RHEL guest runs
 
-## Evidence to retain
+1. Administrator establishes a main ruleset requiring PRs, review from an eligible **non-author**, all Python matrix checks, an **independent** Pages policy gate, no force-push/deletion, and restricted bypass. Verify the ruleset from GitHub; an inaccessible branch-protection endpoint is not proof of protection.
+2. Finish review of draft hardening PRs and check the exact PR head SHA and all CI job results. Never merge just to make an older scan appear clean.
+3. Complete bounded ISO staging, disk quotas/free-space checks, snapshot limits and child-output limits. Validate QCOW2 header before `qemu-img info` can follow external file references, then reject external data files, unexpected backing, encryption/snapshots and wrong virtual size.
+4. Verify the actual dedicated Linux host, ownership, KVM/libvirt/QEMU versions, SELinux/sVirt profile, filesystem capacity, guest device configuration and **effective egress isolation** independently. A no-NIC domain XML is not enough.
+5. Execute the host-only, non-boot Tiny Core canary described in `docs/CLEAN_ROOM_CANARY.md`, under separate explicit owner approval. A boot canary needs a separately hashed serial-console-ready image and fresh approval.
+6. Complete a new Daybreak scan of **exact final merged HEAD**; triage all findings, including documented false positives, and sign off only observed evidence.
 
-- Exact base/head/merge SHA and PR review records
-- Python CI run ID, completion state, test outcomes and logs
-- Daybreak scan run ID and actual findings once requested/executed
-- Individual fixes, test reproductions, negative results and owner approvals
-- Separately stored private VM evidence, logs, release/kernel package identities, snapshot hashes and disclosure records
+## Record and classify evidence
 
-Do not claim "Daybreak clean" until the exact scan has completed successfully for the exact commit and its findings have been reviewed. Unfinished scans or zero results from a failed run are inconclusive.
+Retain exact commits, PR approvals, CI run/job IDs, tool and media identities, test inputs and seeds, UTC dates, exit statuses and negative results. Label evidence **mocked**, **unit-tested**, **statically reviewed**, **Daybreak reported**, **host verified**, or **VM executed** accurately. No privileged VM activity, host stress, external scanning, RHEL installation or media downloads are authorized by this document.
+
+Read AGENTS.md, SECURITY.md, docs/RESEARCH_PROTOCOL.md and docs/VIRTUAL_TESTBED.md before requesting any active operation.
