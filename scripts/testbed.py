@@ -141,65 +141,260 @@ def render_xml(cfg: dict, root: Path) -> str:
     return xml
 
 
+_DOMAIN_XML_SHAPE = {
+    ("domain",): (
+        {"type", "id"},
+        {"name", "uuid", "memory", "currentMemory", "vcpu", "os", "features",
+         "cpu", "clock", "on_poweroff", "on_reboot", "on_crash", "pm", "devices",
+         "seclabel"},
+    ),
+    ("domain", "name"): (set(), set()),
+    ("domain", "uuid"): (set(), set()),
+    ("domain", "memory"): ({"unit"}, set()),
+    ("domain", "currentMemory"): ({"unit"}, set()),
+    ("domain", "vcpu"): ({"placement", "current"}, set()),
+    ("domain", "os"): (set(), {"type", "boot"}),
+    ("domain", "os", "type"): ({"arch", "machine"}, set()),
+    ("domain", "os", "boot"): ({"dev"}, set()),
+    ("domain", "features"): (set(), {"acpi", "apic"}),
+    ("domain", "features", "acpi"): (set(), set()),
+    ("domain", "features", "apic"): (set(), set()),
+    ("domain", "cpu"): ({"mode", "match", "check", "migratable"},
+                         {"model", "vendor", "feature", "topology"}),
+    ("domain", "cpu", "model"): ({"fallback"}, set()),
+    ("domain", "cpu", "vendor"): (set(), set()),
+    ("domain", "cpu", "feature"): ({"policy", "name"}, set()),
+    ("domain", "cpu", "topology"): (
+        {"sockets", "dies", "clusters", "cores", "threads"}, set()),
+    ("domain", "clock"): ({"offset"}, {"timer"}),
+    ("domain", "clock", "timer"): (
+        {"name", "tickpolicy", "present", "track", "mode", "frequency"}, {"catchup"}),
+    ("domain", "clock", "timer", "catchup"): ({"threshold", "slew", "limit"}, set()),
+    ("domain", "on_poweroff"): (set(), set()),
+    ("domain", "on_reboot"): (set(), set()),
+    ("domain", "on_crash"): (set(), set()),
+    ("domain", "pm"): (set(), {"suspend-to-mem", "suspend-to-disk"}),
+    ("domain", "pm", "suspend-to-mem"): ({"enabled"}, set()),
+    ("domain", "pm", "suspend-to-disk"): ({"enabled"}, set()),
+    ("domain", "seclabel"): ({"type", "model", "relabel"}, {"label", "imagelabel"}),
+    ("domain", "seclabel", "label"): (set(), set()),
+    ("domain", "seclabel", "imagelabel"): (set(), set()),
+    ("domain", "devices"): (
+        set(), {"disk", "serial", "console", "controller", "input", "video",
+                "memballoon", "emulator"}),
+    ("domain", "devices", "disk"): (
+        {"type", "device"},
+        {"driver", "source", "target", "readonly", "alias", "address", "backingStore"}),
+    ("domain", "devices", "disk", "driver"): ({"name", "type"}, set()),
+    ("domain", "devices", "disk", "source"): ({"file", "index"}, set()),
+    ("domain", "devices", "disk", "target"): ({"dev", "bus"}, set()),
+    ("domain", "devices", "disk", "readonly"): (set(), set()),
+    ("domain", "devices", "disk", "alias"): ({"name"}, set()),
+    ("domain", "devices", "disk", "address"): (
+        {"type", "domain", "bus", "slot", "function", "controller", "target", "unit"},
+        set()),
+    # Libvirt emits an empty marker for a standalone image. Any backing attributes or
+    # descendants are rejected by the recursive shape check.
+    ("domain", "devices", "disk", "backingStore"): (set(), set()),
+    ("domain", "devices", "serial"): (
+        {"type"}, {"source", "target", "alias", "address"}),
+    ("domain", "devices", "serial", "source"): ({"path"}, set()),
+    ("domain", "devices", "serial", "target"): ({"type", "port"}, {"model"}),
+    ("domain", "devices", "serial", "target", "model"): ({"name"}, set()),
+    ("domain", "devices", "serial", "alias"): ({"name"}, set()),
+    ("domain", "devices", "serial", "address"): (
+        {"type", "iobase", "irq"}, set()),
+    ("domain", "devices", "console"): (
+        {"type", "tty"}, {"source", "target", "alias", "address"}),
+    ("domain", "devices", "console", "source"): ({"path"}, set()),
+    ("domain", "devices", "console", "target"): ({"type", "port"}, set()),
+    ("domain", "devices", "console", "alias"): ({"name"}, set()),
+    ("domain", "devices", "console", "address"): (
+        {"type", "iobase", "irq"}, set()),
+    ("domain", "devices", "controller"): (
+        {"type", "index", "model", "ports"}, {"model", "target", "alias", "address"}),
+    ("domain", "devices", "controller", "model"): ({"name"}, set()),
+    ("domain", "devices", "controller", "target"): (
+        {"chassis", "port", "busNr", "index", "memReserve"}, set()),
+    ("domain", "devices", "controller", "alias"): ({"name"}, set()),
+    ("domain", "devices", "controller", "address"): (
+        {"type", "domain", "bus", "slot", "function", "controller", "target", "unit",
+         "port", "multifunction"}, set()),
+    ("domain", "devices", "input"): ({"type", "bus"}, {"alias", "address"}),
+    ("domain", "devices", "input", "alias"): ({"name"}, set()),
+    ("domain", "devices", "input", "address"): (
+        {"type", "domain", "bus", "slot", "function", "controller", "port"}, set()),
+    ("domain", "devices", "video"): (set(), {"model", "alias", "address"}),
+    ("domain", "devices", "video", "model"): (
+        {"type", "ram", "vram", "vgamem", "heads", "primary"}, set()),
+    ("domain", "devices", "video", "alias"): ({"name"}, set()),
+    ("domain", "devices", "video", "address"): (
+        {"type", "domain", "bus", "slot", "function"}, set()),
+    ("domain", "devices", "memballoon"): ({"model"}, {"alias", "address", "stats"}),
+    ("domain", "devices", "memballoon", "alias"): ({"name"}, set()),
+    ("domain", "devices", "memballoon", "address"): (
+        {"type", "domain", "bus", "slot", "function"}, set()),
+    ("domain", "devices", "memballoon", "stats"): ({"period"}, set()),
+    ("domain", "devices", "emulator"): (set(), set()),
+}
+
+
+def _audit_xml_shape(node: ET.Element, path: tuple[str, ...] = ("domain",)) -> None:
+    """Fail closed on XML outside the reviewed libvirt-normalized profile."""
+    allowed_attributes, allowed_children = _DOMAIN_XML_SHAPE[path]
+    unexpected_attributes = set(node.attrib) - allowed_attributes
+    if unexpected_attributes:
+        raise TestbedError(
+            f"unexpected attributes on {'/'.join(path)}: {sorted(unexpected_attributes)}")
+    for child in node:
+        if child.tag not in allowed_children:
+            raise TestbedError(f"unexpected XML element: {'/'.join((*path, child.tag))}")
+        _audit_xml_shape(child, (*path, child.tag))
+
+
+def _single(parent: ET.Element, tag: str, *, required: bool = True) -> ET.Element | None:
+    matches = parent.findall(tag)
+    if len(matches) > 1 or required and len(matches) != 1:
+        raise TestbedError(f"expected {'one' if required else 'at most one'} {tag} element")
+    return matches[0] if matches else None
+
+
+def _memory_matches(node: ET.Element | None, expected_bytes: int) -> bool:
+    if node is None:
+        return False
+    units = {"MiB": 1024 * 1024, "KiB": 1024}
+    unit = node.get("unit")
+    return unit in units and int(node.text or "0") * units[unit] == expected_bytes
+
+
 def audit_xml(xml: str, cfg: dict, root: Path) -> None:
-    """Reject interfaces, passthrough, external listeners and unexpected disk paths."""
+    """Require the complete domain tree to match the reviewed offline profile."""
     domain = ET.fromstring(xml)
     if domain.tag != "domain" or domain.get("type") != "kvm":
         raise TestbedError("domain must use KVM")
-    if any("}" in node.tag for node in domain.iter()):
+    if any("}" in node.tag or any("}" in name for name in node.attrib)
+           for node in domain.iter()):
         raise TestbedError("namespaced QEMU overrides or extensions are forbidden")
-    if domain.findtext("name") != cfg["name"]:
+    _audit_xml_shape(domain)
+    if domain.get("id") is not None and not domain.get("id", "").isdigit():
+        raise TestbedError("invalid active domain identifier")
+    name = _single(domain, "name")
+    if name is None or name.text != cfg["name"]:
         raise TestbedError("VM name differs from approved profile")
-    devices = domain.find("devices")
-    if devices is None:
-        raise TestbedError("missing VM devices")
-    allowed = {"disk", "serial", "console", "controller", "input", "video",
-               "memballoon", "emulator"}
-    unexpected = {d.tag for d in devices} - allowed
-    if unexpected:
-        raise TestbedError(f"unexpected devices: {sorted(unexpected)}")
-    forbidden = {"interface", "graphics", "hostdev", "filesystem", "redirdev",
-                 "channel", "shmem", "smartcard", "tpm", "commandline"}
-    if any(node.tag in forbidden for node in domain.iter()):
-        raise TestbedError("network, passthrough, or command-line override present")
-    os_type = domain.find("os/type")
+    uuid = _single(domain, "uuid", required=False)
+    if uuid is not None and re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", uuid.text or "") is None:
+        raise TestbedError("invalid libvirt domain UUID")
+    os_node = _single(domain, "os")
+    if os_node is None:
+        raise TestbedError("missing VM operating-system profile")
+    os_type = _single(os_node, "type")
     if os_type is None or os_type.get("arch") != "x86_64" or os_type.text != "hvm":
         raise TestbedError("unexpected guest architecture or OS type")
-    vcpu = domain.findtext("vcpu")
-    if vcpu != str(cfg["vcpus"]):
+    if os_type.get("machine") is not None and re.fullmatch(
+            r"[A-Za-z0-9_.+-]+", os_type.get("machine", "")) is None:
+        raise TestbedError("invalid normalized machine type")
+    boots = os_node.findall("boot")
+    if len(boots) != 2 or {boot.get("dev") for boot in boots} != {"cdrom", "hd"}:
+        raise TestbedError("only CD-ROM and disk boot are allowed")
+    vcpu = _single(domain, "vcpu")
+    if vcpu is None or vcpu.text != str(cfg["vcpus"]):
         raise TestbedError("vCPU count does not match the profile")
-    memory = domain.find("memory")
-    if memory is None:
-        raise TestbedError("missing memory configuration")
+    if vcpu.get("placement") not in {None, "static"}:
+        raise TestbedError("unexpected vCPU placement")
+    if vcpu.get("current") not in {None, str(cfg["vcpus"])}:
+        raise TestbedError("active vCPU count does not match the profile")
     memory_bytes = cfg["memory_mib"] * 1024 * 1024
-    units = {"MiB": 1024 * 1024, "KiB": 1024}
-    if memory.get("unit") not in units or int(memory.text or "0") * units[memory.get("unit")] != memory_bytes:
+    if not _memory_matches(_single(domain, "memory"), memory_bytes):
         raise TestbedError("memory allocation differs from the profile")
+    current_memory = _single(domain, "currentMemory", required=False)
+    if current_memory is not None and not _memory_matches(current_memory, memory_bytes):
+        raise TestbedError("current memory differs from the profile")
+    for singleton in ("features", "cpu", "clock", "on_poweroff", "on_reboot",
+                      "on_crash", "pm"):
+        _single(domain, singleton, required=False)
+    for action, expected_action in (("on_poweroff", "destroy"),
+                                    ("on_reboot", "restart"),
+                                    ("on_crash", "destroy")):
+        node = domain.find(action)
+        if node is not None and node.text != expected_action:
+            raise TestbedError(f"unexpected {action} policy")
+    for suspend in domain.findall("pm/*"):
+        if suspend.get("enabled") != "no":
+            raise TestbedError("invalid power-management policy")
+    clock = domain.find("clock")
+    if clock is not None and clock.get("offset") != "utc":
+        raise TestbedError("only a UTC guest clock is allowed")
+    label_models = set()
+    for label in domain.findall("seclabel"):
+        process_labels = label.findall("label")
+        image_labels = label.findall("imagelabel")
+        if (label.get("type") != "dynamic" or label.get("relabel") != "yes"
+                or label.get("model") not in {"selinux", "dac"}
+                or label.get("model") in label_models
+                or len(process_labels) > 1 or len(image_labels) > 1
+                or len(process_labels) != len(image_labels)):
+            raise TestbedError("unapproved domain security label")
+        label_models.add(label.get("model"))
+        if label.get("model") == "selinux":
+            category = r"(?::c[0-9]+,c[0-9]+)?"
+            process_pattern = rf"[A-Za-z0-9_]+:[A-Za-z0-9_]+:svirt_t:s0{category}"
+            image_pattern = rf"[A-Za-z0-9_]+:[A-Za-z0-9_]+:svirt_image_t:s0{category}"
+        else:
+            process_pattern = image_pattern = r"\+?[0-9]+:\+?[0-9]+"
+        if ((process_labels and re.fullmatch(
+                process_pattern, process_labels[0].text or "") is None)
+                or (image_labels and re.fullmatch(
+                    image_pattern, image_labels[0].text or "") is None)):
+            raise TestbedError("invalid dynamic domain security context")
+    devices = _single(domain, "devices")
+    if devices is None:
+        raise TestbedError("missing VM devices")
+    if len(devices.findall("serial")) != 1 or len(devices.findall("console")) != 1:
+        raise TestbedError("expected exactly one serial device and console")
+    if (len(devices.findall("emulator")) > 1 or len(devices.findall("video")) > 1
+            or len(devices.findall("memballoon")) > 1):
+        raise TestbedError("duplicate emulator, video, or memory balloon device")
     for port in devices.findall("serial") + devices.findall("console"):
         if port.get("type") != "pty":
             raise TestbedError("only local PTY serial/console devices are allowed")
-        if any(child.tag not in {"source", "target", "alias", "address"} for child in port):
-            raise TestbedError("unexpected serial/console attachment")
-        for source in port.findall("source"):
-            if set(source.attrib) != {"path"} or not re.fullmatch(r"/dev/pts/[0-9]+", source.get("path", "")):
-                raise TestbedError("unexpected PTY source path")
+        sources = port.findall("source")
+        if len(sources) > 1 or any(
+                not re.fullmatch(r"/dev/pts/[0-9]+", source.get("path", ""))
+                for source in sources):
+            raise TestbedError("unexpected PTY source path")
+        if port.get("tty") is not None and (
+                len(sources) != 1 or port.get("tty") != sources[0].get("path")):
+            raise TestbedError("console TTY differs from its PTY source")
+        target = _single(port, "target")
+        if target is None or target.get("port") != "0":
+            raise TestbedError("unexpected serial/console target")
+        if port.tag == "serial" and target.get("type") not in {None, "isa-serial"}:
+            raise TestbedError("unexpected serial target type")
+        if port.tag == "console" and target.get("type") not in {None, "serial"}:
+            raise TestbedError("unexpected console target type")
+        model = target.find("model")
+        if model is not None and model.get("name") != "isa-serial":
+            raise TestbedError("unexpected serial model")
     for item in devices.findall("input"):
         if (item.get("type") not in {"mouse", "tablet", "keyboard"}
                 or item.get("bus") not in {None, "ps2", "usb", "virtio"}
-                or item.find("source") is not None):
+                or len(item.findall("alias")) > 1 or len(item.findall("address")) > 1):
             raise TestbedError("host input passthrough is forbidden")
     for item in devices.findall("video"):
-        if item.find(".//acceleration[@accel3d='yes']") is not None:
-            raise TestbedError("3D host GPU acceleration is forbidden")
+        if len(item.findall("model")) != 1:
+            raise TestbedError("unexpected video model")
+    for item in devices.findall("memballoon"):
+        if item.get("model") not in {"virtio", "none"}:
+            raise TestbedError("unexpected memory balloon model")
     emulator = devices.find("emulator")
     if emulator is not None and emulator.text not in {
         "/usr/bin/qemu-system-x86_64", "/usr/libexec/qemu-kvm"
     }:
         raise TestbedError("unapproved QEMU emulator executable")
-    if any(b.get("dev") not in {"cdrom", "hd"} for b in domain.findall(".//boot")):
-        raise TestbedError("non-disk or network boot is forbidden")
-    expected = {"disk": (str(root / "disk.qcow2"), "qcow2"),
-                "cdrom": (str(staged_iso(root)), "raw")}
+    expected = {"disk": (str(root / "disk.qcow2"), "qcow2", "vda", "virtio"),
+                "cdrom": (str(staged_iso(root)), "raw", "sda", "sata")}
     actual_disks = devices.findall("disk")
     if len(actual_disks) != 2:
         raise TestbedError("expected exactly disk and ISO")
@@ -207,14 +402,27 @@ def audit_xml(xml: str, cfg: dict, root: Path) -> None:
         kind = item.get("device")
         if kind not in expected or item.get("type") != "file":
             raise TestbedError("unknown disk/device source")
-        file_path, fmt = expected.pop(kind)
-        src, driver = item.find("source"), item.find("driver")
+        file_path, fmt, target_name, bus = expected.pop(kind)
+        src = _single(item, "source")
+        driver = _single(item, "driver")
+        target = _single(item, "target")
         if src is None or src.get("file") != file_path:
             raise TestbedError(f"unsafe {kind} source")
+        if src.get("index") is not None and not src.get("index", "").isdigit():
+            raise TestbedError(f"invalid normalized {kind} source index")
         if driver is None or driver.get("type") != fmt or driver.get("name") != "qemu":
             raise TestbedError(f"unsafe {kind} format")
-        if kind == "cdrom" and item.find("readonly") is None:
-            raise TestbedError("ISO must remain read-only")
+        if target is None or target.get("dev") != target_name or target.get("bus") != bus:
+            raise TestbedError(f"unsafe {kind} target")
+        readonly = item.findall("readonly")
+        if (kind == "cdrom" and len(readonly) != 1) or (kind == "disk" and readonly):
+            raise TestbedError("only the ISO may be read-only")
+        for optional in ("alias", "address", "backingStore"):
+            if len(item.findall(optional)) > 1:
+                raise TestbedError(f"duplicate normalized disk {optional}")
+        backing = item.find("backingStore")
+        if backing is not None and backing.text and backing.text.strip():
+            raise TestbedError("disk backing marker must be empty")
     if expected:
         raise TestbedError("disk or ISO missing")
 
