@@ -583,7 +583,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             report = snapshot(cfg, root, args.label, args.source_sha, args.approve)
     except (TestbedError, safe_fs.UnsafePath, OSError, ValueError, subprocess.SubprocessError, ET.ParseError) as exc:
-        print(f"FAIL: {exc}", file=sys.stderr)
+        # Escape untrusted control characters before writing to the terminal.
+        print("FAIL: " + ascii(str(exc))[1:-1], file=sys.stderr)
         return 1
     print(json.dumps(report, sort_keys=True, indent=2))
     return 0

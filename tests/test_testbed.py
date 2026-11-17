@@ -60,6 +60,42 @@ class TestbedTests(unittest.TestCase):
         with self.assertRaises(t.TestbedError):
             t.read_config(self.config_path)
 
+    def test_main_escapes_terminal_controls_in_config_error(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        key = r"bad\u001b[2J\n\u001b]52;c;value\u0007"
+        self.config_path.write_text(
+            f'{{"{key}":1,"{key}":2}}', encoding="utf-8")
+        errors = StringIO()
+        with redirect_stderr(errors):
+            status = t.main([
+                "plan", "--config", str(self.config_path),
+                "--lab-root", str(self.root), "--iso", str(self.iso),
+            ])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            errors.getvalue(),
+            "FAIL: duplicate JSON property: "
+            "bad\\x1b[2J\\n\\x1b]52;c;value\\x07\n",
+        )
+
+    def test_main_preserves_plain_failure_diagnostic(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        self.cfg["network"] = "nat"
+        self.write_config()
+        errors = StringIO()
+        with redirect_stderr(errors):
+            status = t.main([
+                "plan", "--config", str(self.config_path),
+                "--lab-root", str(self.root), "--iso", str(self.iso),
+            ])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            errors.getvalue(),
+            "FAIL: only x86_64 and network=none are allowed\n",
+        )
+
     def test_xml_is_serial_only(self):
         xml = t.render_xml(self.cfg, self.root)
         self.assertIn("rhel-lab-offline-01", xml)
