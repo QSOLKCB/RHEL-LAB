@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 #!/usr/bin/env python3
 """Fail-closed, offline GitHub Pages policy check for QSOLKCB/RHEL-LAB.
 
