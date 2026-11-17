@@ -8,7 +8,7 @@ This milestone supplies an offline-first *host-side implementation*, not a prein
 - One x86_64 guest, 2 vCPUs, 4096 MiB RAM, standalone 48 GiB QCOW2 virtual disk. Configuration is in lab/testbed.json.
 - **No guest NIC, bridge, NAT, hostdev, host share, USB redirection, graphics listener or public service** in the generated domain XML.
 - Serial PTY console only. Guest ISO must be obtained separately from authorized Red Hat distribution; no proprietary image is committed.
-- Images, private receipts and XML live in a pinned, operator-owned 0700 directory under trusted ancestors **outside the Git repository**.
+- Images, a private staged installer copy, receipts and XML live in a pinned, operator-owned 0700 directory under trusted ancestors **outside the Git repository**.
 - Every host-changing command is explicit, opt-in, and fail-closed. No automatic boot, package installation, VM definition, snapshot restore, or host network configuration.
 - A definition/active XML audit rejects unexpected disks, device passthrough, guest networking and external graphics. **This is a configuration audit, not proof of effective egress isolation.**
 - No GitHub Pages, public dashboard or network endpoint.
@@ -19,7 +19,7 @@ Use a personally controlled Linux host with KVM support and local libvirt/QEMU t
 
 Check the actual hardware, hypervisor, firmware support, host ownership, VM resource budget, filesystem permissions and guest media authenticity yourself. The lab-root parent and ancestors must be root/operator-owned and not group/other writable (the root-owned sticky /tmp convention is recognized); a new lab root is created 0700. Avoid shared mountpoints. The scripted plan **does not** check that a physical host is isolated.
 
-Download the correct RHEL installer ISO using your own authorized account, verify its official checksum/signature, and keep it outside Git. No vendor access credential belongs in a script, PR or public log.
+Download the correct RHEL installer ISO using your own authorized account, verify its official checksum/signature, and keep it outside Git. The source file must be root/operator-owned and not group/other writable; its ancestors follow the same trusted-path rules, including the root-owned sticky-directory exception. Preparation refuses a source that a lower-trust local user can replace. No vendor access credential belongs in a script, PR or public log.
 
 ## Commands (host only, not GitHub Actions)
 
@@ -32,15 +32,21 @@ Preview the generated domain XML and paths without execution. The ISO must actua
 
     uv run --no-project python scripts/testbed.py plan --lab-root "$LAB" --iso "$ISO"
 
+The previewed XML points its CD-ROM at `$LAB/installer.iso`, the private copy that preparation will create, rather than at the source pathname.
+
 After manually reviewing the XML and approving disk preparation, run:
 
     uv run --no-project python scripts/testbed.py prepare \
       --lab-root "$LAB" --iso "$ISO" \
       --approve I_AUTHORIZE_LOCAL_VM_PREPARATION
 
-This creates the private folder, a blank QCOW2 image and domain.xml only. It **does not** define, start, install or connect a guest. The exact approval phrase is deliberate.
+This creates the private folder, an exclusive 0600 `installer.iso` copy, its private identity/SHA-256 receipt, a blank QCOW2 image and domain.xml. The copy is read through a pinned no-follow descriptor, and the file and directory are synced before preparation returns. It **does not** define, start, install or connect a guest. The exact approval phrase is deliberate. A recorded digest establishes staged byte identity; it does not replace the operator's vendor signature/checksum validation.
 
-Inspect domain.xml and then, **only after explicit owner authorization for this VM**, manually define and boot it with the user libvirt connection:
+Inspect domain.xml and the staged-media receipt. Then re-open the private media through the pinned verification path immediately before the separately authorized libvirt operations:
+
+    uv run --no-project python scripts/testbed.py verify-media --lab-root "$LAB"
+
+Only after that check succeeds and the owner explicitly authorizes this VM, manually define and boot it with the user libvirt connection:
 
     virsh -c qemu:///session define "$LAB/domain.xml"
     virsh -c qemu:///session start rhel-lab-offline-01
@@ -50,7 +56,7 @@ The console is serial-only; the selected RHEL installer must support or be confi
 
 Audit both persistent and current domain XML (including possible live changes):
 
-    uv run --no-project python scripts/testbed.py audit-defined --lab-root "$LAB" --iso "$ISO"
+    uv run --no-project python scripts/testbed.py audit-defined --lab-root "$LAB"
 
 Re-run this after installation, host/libvirt configuration changes and before each experiment. The audit does not prove firewall state, process isolation or that the guest cannot access host services via other channels. A no-NIC VM still needs review of storage, console, device and host controls.
 
@@ -65,7 +71,7 @@ Only when it reports shut off and an approved exclusive offline window exists, t
 
     SHA="$(git rev-parse HEAD)"
     uv run --no-project python scripts/testbed.py snapshot \
-      --lab-root "$LAB" --iso "$ISO" \
+      --lab-root "$LAB" \
       --label baseline-001 --source-sha "$SHA" \
       --approve I_AUTHORIZE_OFFLINE_SNAPSHOT
 
@@ -89,6 +95,6 @@ The repository does not deploy an RHEL guest automatically, bypass subscription 
     uv run --no-project python -m unittest discover -s tests -v
     uv run --no-project python -m compileall -q scripts tests
 
-The unit tests simulate unsafe profile changes, network injection, path substitution, root/symlink attacks, missing approvals, running guest snapshot refusal and both libvirt XML views. They do not invoke real QEMU/virsh or use a VM.
+The unit tests simulate unsafe profile changes, network injection, source-media substitution, staged-media tampering, path substitution, root/symlink attacks, missing approvals, running guest snapshot refusal and both libvirt XML views. They do not invoke real QEMU/virsh or use a VM.
 
 Read AGENTS.md, docs/RESEARCH_PROTOCOL.md, and docs/DAYBREAK_GATE.md before approving any live operation.
