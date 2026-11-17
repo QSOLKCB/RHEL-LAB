@@ -107,6 +107,92 @@ class EvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(EvidenceError, "file records"):
                 verify(self.data, self.manifest)
 
+    def test_scan_file_limit_rejects_before_opening_excess_file(self) -> None:
+        real_open = os.open
+        opened = []
+
+        def record_open(name, flags, *args, **kwargs):
+            opened.append(name)
+            return real_open(name, flags, *args, **kwargs)
+
+        with patch("scripts.evidence.MAX_MANIFEST_FILES", 1):
+            with patch("scripts.evidence.os.open", side_effect=record_open):
+                with self.assertRaisesRegex(EvidenceError, "file records"):
+                    inventory(self.data)
+        self.assertNotIn("z.log", opened)
+
+    def test_scan_entry_limit_bounds_directory_enumeration(self) -> None:
+        real_scandir = os.scandir
+        pulls = []
+
+        class CountingIterator:
+            def __init__(self, iterator):
+                self.iterator = iterator
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.iterator.close()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                pulls.append(None)
+                if len(pulls) > 2:
+                    raise AssertionError("scan consumed beyond remaining allowance plus one")
+                return next(self.iterator)
+
+        def counting_scandir(fd):
+            return CountingIterator(real_scandir(fd))
+
+        with patch("scripts.evidence.os.scandir", side_effect=counting_scandir):
+            with self.assertRaisesRegex(EvidenceError, "entry traversal limit"):
+                inventory(self.data, max_entries=1)
+        self.assertEqual(len(pulls), 2)
+
+    def test_sparse_file_limit_rejects_before_hashing(self) -> None:
+        sparse = self.data / "0-sparse.bin"
+        sparse.touch()
+        with sparse.open("r+b") as stream:
+            stream.truncate(1_000_001)
+        with patch("scripts.evidence.os.read") as read:
+            with self.assertRaisesRegex(EvidenceError, "per-file limit"):
+                inventory(self.data, max_file_bytes=1_000_000)
+        read.assert_not_called()
+
+    def test_file_growth_is_bounded_during_hashing(self) -> None:
+        with patch("scripts.evidence.os.read", return_value=b"x" * 7) as read:
+            with self.assertRaisesRegex(EvidenceError, "per-file limit"):
+                inventory(self.data, max_file_bytes=6, max_total_bytes=12)
+        self.assertEqual(read.call_args.args[1], 7)
+
+    def test_aggregate_limit_rejects_before_opening_next_file(self) -> None:
+        real_open = os.open
+        opened = []
+
+        def record_open(name, flags, *args, **kwargs):
+            opened.append(name)
+            return real_open(name, flags, *args, **kwargs)
+
+        with patch("scripts.evidence.os.open", side_effect=record_open):
+            with self.assertRaisesRegex(EvidenceError, "aggregate limit"):
+                inventory(self.data, max_file_bytes=6, max_total_bytes=6)
+        self.assertNotIn("z.log", opened)
+
+    def test_explicit_scan_limits_preserve_roundtrip(self) -> None:
+        limits = {"max_entries": 2, "max_file_bytes": 6, "max_total_bytes": 12}
+        expected = seal(self.data, self.manifest, **limits)
+        self.assertEqual(verify(self.data, self.manifest, **limits), expected)
+
+    def test_verify_checks_manifest_budget_before_actual_scan(self) -> None:
+        seal(self.data, self.manifest, max_file_bytes=6, max_total_bytes=12)
+        with patch("scripts.evidence._inventory_fd") as actual_inventory:
+            with self.assertRaisesRegex(EvidenceError, "per-file limit"):
+                verify(self.data, self.manifest, max_file_bytes=5)
+        actual_inventory.assert_not_called()
+
     def test_manifest_path_length_is_bounded(self) -> None:
         seal(self.data, self.manifest)
         with patch("scripts.evidence.MAX_MANIFEST_PATH_CHARS", 4):
@@ -250,7 +336,7 @@ class EvidenceTests(unittest.TestCase):
         original = self.base / "dest"
         original.mkdir(mode=0o700)
         moved = self.base / "moved"
-        def swap(fd):
+        def swap(fd, _limits):
             original.rename(moved)
             original.symlink_to(self.data, target_is_directory=True)
             return original_inventory
