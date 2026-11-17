@@ -8,12 +8,14 @@ import json
 import os
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 from xml.etree import ElementTree as ET
 
 try:
@@ -33,10 +35,27 @@ SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 MEDIA_SCHEMA = "qsol-rhel-staged-media/v1"
 STAGED_ISO = "installer.iso"
 MEDIA_RECEIPT = "installer.iso.receipt.json"
+HELPER_PATHS = {
+    "qemu-img": Path("/usr/bin/qemu-img"),
+    "virsh": Path("/usr/bin/virsh"),
+}
+COMMAND_PATH = "/usr/bin"
+COMMAND_ENV_PASSTHROUGH = ("HOME", "XDG_RUNTIME_DIR")
 
 
 class TestbedError(ValueError):
     """Refused unsafe or unsupported operation."""
+
+
+@dataclass(frozen=True)
+class PinnedHelper:
+    """Trusted executable identity held open across every invocation."""
+
+    name: str
+    path: Path
+    fd: int
+    device: int
+    inode: int
 
 
 def _pairs(items: list[tuple[str, object]]) -> dict:
@@ -228,29 +247,66 @@ def _diagnostic(value: str | bytes | None) -> str:
     return value
 
 
-def local_command(args: list[str], timeout: int = 30,
-                  *, pass_fds: tuple[int, ...] = ()) -> str:
+def _command_environment() -> dict[str, str]:
+    environment = {"PATH": COMMAND_PATH, "LC_ALL": "C"}
+    for name in COMMAND_ENV_PASSTHROUGH:
+        value = os.environ.get(name)
+        if value is not None:
+            environment[name] = value
+    return environment
+
+
+def _executable_by_operator(info: os.stat_result) -> bool:
+    if os.geteuid() == 0:
+        return bool(info.st_mode & 0o111)
+    if info.st_uid == os.geteuid():
+        return bool(info.st_mode & stat.S_IXUSR)
+    if info.st_gid == os.getegid() or info.st_gid in os.getgroups():
+        return bool(info.st_mode & stat.S_IXGRP)
+    return bool(info.st_mode & stat.S_IXOTH)
+
+
+@contextmanager
+def pinned_helper(name: str) -> Iterator[PinnedHelper]:
     try:
-        result = subprocess.run(args, check=True, timeout=timeout,
-                                capture_output=True, text=True, pass_fds=pass_fds)
+        path = HELPER_PATHS[name]
+    except KeyError as exc:
+        raise TestbedError(f"unsupported local dependency: {name}") from exc
+    try:
+        with safe_fs.trusted_regular(path) as fd:
+            info = os.fstat(fd)
+            if not _executable_by_operator(info):
+                raise TestbedError(f"local dependency is not executable: {path}")
+            yield PinnedHelper(name, path, fd, info.st_dev, info.st_ino)
+    except FileNotFoundError as exc:
+        raise TestbedError(f"missing local dependency: {path}") from exc
+
+
+def local_command(helper: PinnedHelper, args: list[str], timeout: int = 30,
+                  *, pass_fds: tuple[int, ...] = ()) -> str:
+    current = os.fstat(helper.fd)
+    if (current.st_dev, current.st_ino) != (helper.device, helper.inode):
+        raise TestbedError(f"local dependency identity changed: {helper.path}")
+    argv = [str(helper.path), *args]
+    inherited_fds = tuple(dict.fromkeys((*pass_fds, helper.fd)))
+    try:
+        result = subprocess.run(
+            argv, executable=f"/proc/self/fd/{helper.fd}", check=True,
+            timeout=timeout, capture_output=True, text=True,
+            pass_fds=inherited_fds, env=_command_environment())
     except subprocess.CalledProcessError as exc:
         raise TestbedError(
-            f"{args[0]} returned exit status {exc.returncode}; "
+            f"{helper.path} returned exit status {exc.returncode}; "
             f"captured stdout: {_diagnostic(exc.stdout)}; "
             f"captured stderr: {_diagnostic(exc.stderr)}"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise TestbedError(
-            f"{args[0]} timed out after {exc.timeout}s; "
+            f"{helper.path} timed out after {exc.timeout}s; "
             f"captured stdout: {_diagnostic(exc.stdout)}; "
             f"captured stderr: {_diagnostic(exc.stderr)}"
         ) from exc
     return result.stdout.strip()
-
-
-def need(command: str) -> None:
-    if shutil.which(command) is None:
-        raise TestbedError(f"missing local dependency: {command}")
 
 
 def approve(value: str | None, expected: str) -> None:
@@ -422,13 +478,13 @@ def plan(cfg: dict, root: Path, iso: Path) -> dict:
 
 def prepare(cfg: dict, root: Path, iso: Path, token: str | None) -> dict:
     approve(token, PREPARE_TOKEN)
-    need("qemu-img")
     iso = iso_file(str(iso))
     disk, definition = paths(root)
     xml = render_xml(cfg, root)
     # Keep an operator-owned, private lab FD open across all host mutations.
     # qemu-img receives an inherited FD, never a mutable ancestor pathname.
-    with safe_fs.lab_directory(root, create=True) as lab_fd:
+    with pinned_helper("qemu-img") as qemu_img, \
+            safe_fs.lab_directory(root, create=True) as lab_fd:
         if any(safe_fs.exists_at(lab_fd, name) for name in
                ("disk.qcow2", "domain.xml", STAGED_ISO, MEDIA_RECEIPT)):
             raise TestbedError("refusing to replace existing lab state")
@@ -437,8 +493,8 @@ def prepare(cfg: dict, root: Path, iso: Path, token: str | None) -> dict:
                           safe_fs.FILE_RDWR_CREATE_FLAGS,
                           0o600, dir_fd=lab_fd)
         try:
-            local_command(["qemu-img", "create", "-f", "qcow2",
-                           f"/proc/self/fd/{disk_fd}", f"{cfg['disk_gib']}G"],
+            local_command(qemu_img, ["create", "-f", "qcow2",
+                          f"/proc/self/fd/{disk_fd}", f"{cfg['disk_gib']}G"],
                           timeout=120, pass_fds=(disk_fd,))
         finally:
             os.close(disk_fd)
@@ -463,15 +519,20 @@ def verify_media(root: Path) -> dict:
             "manual_next": f"virsh -c {URI} define {root / 'domain.xml'}"}
 
 
-def audit_defined(cfg: dict, root: Path) -> dict:
-    need("virsh")
+def _audit_defined(cfg: dict, root: Path, virsh: PinnedHelper) -> dict:
     verify_staged_iso(root)
     # Verify stored XML AND current (possibly live/hotplugged) XML.
     for options in (["--inactive"], []):
-        xml = local_command(["virsh", "-c", URI, "dumpxml", *options, cfg["name"]])
+        xml = local_command(
+            virsh, ["-c", URI, "dumpxml", *options, cfg["name"]])
         audit_xml(xml, cfg, root)
     return {"status": "DOMAIN_XML_AUDITED", "domain": cfg["name"],
             "limitation": "Does not prove host egress isolation or prevent races."}
+
+
+def audit_defined(cfg: dict, root: Path) -> dict:
+    with pinned_helper("virsh") as virsh:
+        return _audit_defined(cfg, root, virsh)
 
 
 def hash_fd(fd: int) -> tuple[str, int]:
@@ -484,17 +545,19 @@ def snapshot(cfg: dict, root: Path, label: str, sha: str,
     approve(token, SNAPSHOT_TOKEN)
     if LABEL.fullmatch(label) is None or SHA.fullmatch(sha) is None:
         raise TestbedError("invalid snapshot label or exact Git commit SHA")
-    need("qemu-img")
-    with safe_fs.lab_directory(root) as lab_fd:
+    with pinned_helper("qemu-img") as qemu_img, \
+            pinned_helper("virsh") as virsh, \
+            safe_fs.lab_directory(root) as lab_fd:
         source_fd = safe_fs.regular_at(lab_fd, "disk.qcow2")
         try:
-            audit_defined(cfg, root)
-            state = local_command(["virsh", "-c", URI, "domstate", cfg["name"]])
+            _audit_defined(cfg, root, virsh)
+            state = local_command(
+                virsh, ["-c", URI, "domstate", cfg["name"]])
             if state != "shut off":
                 raise TestbedError(f"domain is not shut off: {state}")
             source_path = f"/proc/self/fd/{source_fd}"
             metadata = json.loads(local_command(
-                ["qemu-img", "info", "--output=json", source_path],
+                qemu_img, ["info", "--output=json", source_path],
                 pass_fds=(source_fd,)))
             if metadata.get("format") != "qcow2" or metadata.get("backing-filename"):
                 raise TestbedError("only standalone QCOW2 images are supported")
@@ -511,7 +574,8 @@ def snapshot(cfg: dict, root: Path, label: str, sha: str,
                                   0o600, dir_fd=snapshot_fd)
                 published = False
                 try:
-                    local_command(["qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
+                    local_command(qemu_img,
+                                  ["convert", "-f", "qcow2", "-O", "qcow2",
                                    source_path, f"/proc/self/fd/{temp_fd}"],
                                   timeout=3600, pass_fds=(source_fd, temp_fd))
                     source_after = os.fstat(source_fd)

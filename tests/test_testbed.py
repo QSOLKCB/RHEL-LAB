@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import testbed as t
 from scripts import safe_fs
@@ -23,6 +23,14 @@ class TestbedTests(unittest.TestCase):
         self.iso = self.base / "rhel.iso"
         self.iso.write_bytes(b"fixture, not installation media")
         self.iso.chmod(0o600)
+        self.helper_dir = self.base / "helpers"
+        self.helper_dir.mkdir(mode=0o700)
+        self.helper_paths = {}
+        for name in ("qemu-img", "virsh"):
+            helper = self.helper_dir / name
+            helper.write_bytes(b"mock executable")
+            helper.chmod(0o700)
+            self.helper_paths[name] = helper
         self.cfg = {
             "schema": t.SCHEMA, "name": "rhel-lab-offline-01",
             "architecture": "x86_64", "network": "none",
@@ -194,9 +202,11 @@ class TestbedTests(unittest.TestCase):
         failure = subprocess.CalledProcessError(7, ["virsh", "domstate"],
                                                output="partial output",
                                                stderr="permission denied")
-        with patch.object(t.subprocess, "run", side_effect=failure):
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                t.pinned_helper("virsh") as virsh, \
+                patch.object(t.subprocess, "run", side_effect=failure):
             with self.assertRaises(t.TestbedError) as caught:
-                t.local_command(["virsh", "domstate"])
+                t.local_command(virsh, ["domstate"])
         self.assertIn("partial output", str(caught.exception))
         self.assertIn("permission denied", str(caught.exception))
         self.assertIn("exit status 7", str(caught.exception))
@@ -205,11 +215,68 @@ class TestbedTests(unittest.TestCase):
         failure = subprocess.TimeoutExpired(["qemu-img", "convert"], 3,
                                            output=b"partial\\xff",
                                            stderr=b"disk full")
-        with patch.object(t.subprocess, "run", side_effect=failure):
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                t.pinned_helper("qemu-img") as qemu_img, \
+                patch.object(t.subprocess, "run", side_effect=failure):
             with self.assertRaises(t.TestbedError) as caught:
-                t.local_command(["qemu-img", "convert"])
+                t.local_command(qemu_img, ["convert"])
         self.assertIn("timed out", str(caught.exception))
         self.assertIn("disk full", str(caught.exception))
+
+    def test_helper_ignores_path_and_executes_pinned_descriptor(self):
+        attacker = self.base / "attacker"
+        attacker.mkdir(mode=0o700)
+        (attacker / "virsh").write_bytes(b"attacker controlled")
+        replacement = self.helper_dir / "replacement"
+        result = Mock(stdout="shut off\n")
+        data_fd = os.open(self.iso, os.O_RDONLY)
+        try:
+            with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                    patch.dict(os.environ, {"PATH": str(attacker)}), \
+                    t.pinned_helper("virsh") as virsh:
+                original = os.fstat(virsh.fd)
+                self.helper_paths["virsh"].rename(replacement)
+                self.helper_paths["virsh"].write_bytes(b"replacement executable")
+                self.helper_paths["virsh"].chmod(0o700)
+                with patch.object(t.subprocess, "run", return_value=result) as run:
+                    output = t.local_command(
+                        virsh, ["domstate"], pass_fds=(data_fd,))
+                    self.assertEqual(output, "shut off")
+                argv = run.call_args.args[0]
+                options = run.call_args.kwargs
+                self.assertEqual(
+                    argv, [str(self.helper_paths["virsh"]), "domstate"])
+                self.assertEqual(
+                    options["executable"], f"/proc/self/fd/{virsh.fd}")
+                self.assertIn(virsh.fd, options["pass_fds"])
+                self.assertIn(data_fd, options["pass_fds"])
+                self.assertEqual(options["env"]["PATH"], t.COMMAND_PATH)
+                self.assertNotIn(str(attacker), options["env"]["PATH"])
+                self.assertEqual(
+                    (os.fstat(virsh.fd).st_dev, os.fstat(virsh.fd).st_ino),
+                    (original.st_dev, original.st_ino))
+        finally:
+            os.close(data_fd)
+
+    def test_helper_under_writable_ancestor_is_rejected(self):
+        shared = self.base / "shared-helpers"
+        shared.mkdir(mode=0o700)
+        helper = shared / "virsh"
+        helper.write_bytes(b"untrusted executable")
+        helper.chmod(0o700)
+        shared.chmod(0o777)
+        with patch.dict(t.HELPER_PATHS, {"virsh": helper}, clear=True):
+            with self.assertRaises(safe_fs.UnsafePath):
+                with t.pinned_helper("virsh"):
+                    self.fail("writable helper ancestor was accepted")
+
+    def test_symlinked_helper_is_rejected(self):
+        alias = self.helper_dir / "virsh-link"
+        alias.symlink_to(self.helper_paths["virsh"])
+        with patch.dict(t.HELPER_PATHS, {"virsh": alias}, clear=True):
+            with self.assertRaises(OSError):
+                with t.pinned_helper("virsh"):
+                    self.fail("symlinked helper was accepted")
 
     def test_prepare_requires_operator_approval(self):
         with self.assertRaises(t.TestbedError):
@@ -217,11 +284,13 @@ class TestbedTests(unittest.TestCase):
         self.assertFalse(self.root.exists())
 
     def test_prepare_never_defines_or_boots_vm(self):
-        def fake_qemu(args, timeout=30, pass_fds=()):
-            self.assertEqual(args[:4], ["qemu-img", "create", "-f", "qcow2"])
-            Path(args[4]).write_bytes(b"simulated image")
+        def fake_qemu(helper, args, timeout=30, pass_fds=()):
+            self.assertEqual(helper.path, self.helper_paths["qemu-img"])
+            self.assertEqual(args[:3], ["create", "-f", "qcow2"])
+            Path(args[3]).write_bytes(b"simulated image")
             return ""
-        with patch.object(t, "need"), patch.object(t, "local_command", side_effect=fake_qemu):
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                patch.object(t, "local_command", side_effect=fake_qemu):
             receipt = t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
         self.assertEqual(receipt["status"], "PREPARED_NOT_DEFINED_OR_BOOTED")
         self.assertTrue((self.root / "domain.xml").is_file())
@@ -244,14 +313,14 @@ class TestbedTests(unittest.TestCase):
     def test_source_replacement_does_not_change_staged_media(self):
         original = self.iso.read_bytes()
 
-        def fake_qemu(args, timeout=30, pass_fds=()):
+        def fake_qemu(helper, args, timeout=30, pass_fds=()):
             self.iso.unlink()
             self.iso.write_bytes(b"replacement media")
-            Path(args[4]).write_bytes(b"simulated image")
+            Path(args[3]).write_bytes(b"simulated image")
             return ""
 
-        with patch.object(t, "need"), patch.object(t, "local_command",
-                                                  side_effect=fake_qemu):
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                patch.object(t, "local_command", side_effect=fake_qemu):
             t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
         self.assertEqual(t.staged_iso(self.root).read_bytes(), original)
         definition = (self.root / "domain.xml").read_text(encoding="utf-8")
@@ -259,24 +328,24 @@ class TestbedTests(unittest.TestCase):
         self.assertNotIn(str(self.iso), definition)
 
     def test_changed_staged_media_is_rejected(self):
-        def fake_qemu(args, timeout=30, pass_fds=()):
-            Path(args[4]).write_bytes(b"simulated image")
+        def fake_qemu(helper, args, timeout=30, pass_fds=()):
+            Path(args[3]).write_bytes(b"simulated image")
             return ""
 
-        with patch.object(t, "need"), patch.object(t, "local_command",
-                                                  side_effect=fake_qemu):
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                patch.object(t, "local_command", side_effect=fake_qemu):
             t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
         t.staged_iso(self.root).write_bytes(b"changed")
         with self.assertRaises(t.TestbedError):
             t.verify_media(self.root)
 
     def test_replaced_staged_inode_is_rejected(self):
-        def fake_qemu(args, timeout=30, pass_fds=()):
-            Path(args[4]).write_bytes(b"simulated image")
+        def fake_qemu(helper, args, timeout=30, pass_fds=()):
+            Path(args[3]).write_bytes(b"simulated image")
             return ""
 
-        with patch.object(t, "need"), patch.object(t, "local_command",
-                                                  side_effect=fake_qemu):
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                patch.object(t, "local_command", side_effect=fake_qemu):
             t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
         staged = t.staged_iso(self.root)
         contents = staged.read_bytes()
@@ -293,7 +362,8 @@ class TestbedTests(unittest.TestCase):
     def test_snapshot_refuses_live_vm(self):
         self.root.mkdir(mode=0o700)
         (self.root / "disk.qcow2").write_bytes(b"fixture")
-        with patch.object(t, "need"), patch.object(t, "audit_defined"), \
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+             patch.object(t, "_audit_defined"), \
              patch.object(t, "local_command", return_value="running"):
             with self.assertRaises(t.TestbedError):
                 t.snapshot(self.cfg, self.root, "baseline", "a" * 40,
@@ -308,10 +378,12 @@ class TestbedTests(unittest.TestCase):
     def test_audit_checks_both_live_and_persistent(self):
         safe = t.render_xml(self.cfg, self.root)
         calls = []
-        def fake_command(args, timeout=30):
+        def fake_command(helper, args, timeout=30):
+            self.assertEqual(helper.path, self.helper_paths["virsh"])
             calls.append(args)
             return safe
-        with patch.object(t, "need"), patch.object(t, "verify_staged_iso"), \
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+             patch.object(t, "verify_staged_iso"), \
              patch.object(t, "local_command", side_effect=fake_command):
             t.audit_defined(self.cfg, self.root)
         self.assertEqual(len(calls), 2)
@@ -331,16 +403,16 @@ class TestbedTests(unittest.TestCase):
         attacker = self.base / "outside"
         attacker.mkdir(mode=0o700)
 
-        def raced_qemu(args, timeout=30, pass_fds=()):
-            self.assertEqual(args[:4], ["qemu-img", "create", "-f", "qcow2"])
+        def raced_qemu(helper, args, timeout=30, pass_fds=()):
+            self.assertEqual(args[:3], ["create", "-f", "qcow2"])
             self.assertEqual(len(pass_fds), 1)
             self.root.rename(moved)
             self.root.symlink_to(attacker, target_is_directory=True)
-            Path(args[4]).write_bytes(b"simulated image")
+            Path(args[3]).write_bytes(b"simulated image")
             return ""
 
-        with patch.object(t, "need"), patch.object(t, "local_command",
-                                                side_effect=raced_qemu):
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                patch.object(t, "local_command", side_effect=raced_qemu):
             t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
         self.assertTrue((moved / "domain.xml").is_file())
         self.assertTrue((moved / "disk.qcow2").is_file())
@@ -352,7 +424,7 @@ class TestbedTests(unittest.TestCase):
         outside = self.base / "outside.qcow2"
         outside.write_bytes(b"secret")
         (self.root / "disk.qcow2").symlink_to(outside)
-        with patch.object(t, "need"):
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True):
             with self.assertRaises(OSError):
                 t.snapshot(self.cfg, self.root, "baseline", "a" * 40,
                            t.SNAPSHOT_TOKEN)
@@ -361,19 +433,20 @@ class TestbedTests(unittest.TestCase):
         self.root.mkdir(mode=0o700)
         (self.root / "disk.qcow2").write_bytes(b"fake disk")
 
-        def fake_command(args, timeout=30, pass_fds=()):
-            if args[:2] == ["virsh", "-c"]:
+        def fake_command(helper, args, timeout=30, pass_fds=()):
+            if helper.name == "virsh" and args[:1] == ["-c"]:
                 return "shut off"
-            if args[:2] == ["qemu-img", "info"]:
+            if helper.name == "qemu-img" and args[:1] == ["info"]:
                 self.assertTrue(pass_fds)
                 return '{"format":"qcow2"}'
-            if args[:2] == ["qemu-img", "convert"]:
+            if helper.name == "qemu-img" and args[:1] == ["convert"]:
                 self.assertEqual(len(pass_fds), 2)
                 Path(args[-1]).write_bytes(b"converted evidence")
                 return ""
-            self.fail(f"unexpected command: {args}")
+            self.fail(f"unexpected command: {helper.name} {args}")
 
-        with patch.object(t, "need"), patch.object(t, "audit_defined"), \
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+             patch.object(t, "_audit_defined"), \
              patch.object(t, "local_command", side_effect=fake_command):
             result = t.snapshot(self.cfg, self.root, "baseline",
                                 "a" * 40, t.SNAPSHOT_TOKEN)
