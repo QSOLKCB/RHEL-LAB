@@ -1,10 +1,13 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 #!/bin/bash
 # QSOL-IMC RHEL-LAB: offline host state and before/after SHA-256 receipts.
 # Run as an unprivileged user. NO sudo, installs, networking or VM actions.
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-exec /usr/bin/python3 - "$@" <<'PYTHON'
+exec /usr/bin/python3 -I - "$@" <<'PYTHON'
 from __future__ import annotations
 import argparse
 import datetime
@@ -31,6 +34,9 @@ class Refusal(ValueError):
 
 def canonical(path):
     path = pathlib.Path(path)
+    if any(ord(character) < 32 or ord(character) == 127
+           for character in os.fspath(path)):
+        raise Refusal("control characters are forbidden in host paths")
     if ".." in path.parts:
         raise Refusal("parent traversal is forbidden")
     if not path.is_absolute():
@@ -163,19 +169,22 @@ def child_limits():
     resource.setrlimit(resource.RLIMIT_FSIZE, (128 * 1024, 128 * 1024))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
-def run(name, *args):
+def run(name, *args, pass_fds=()):
     exe = binary(name)
     if exe is None:
         return {"status": "unavailable_or_untrusted"}
     env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C",
            "LANG": "C", "HOME": str(pathlib.Path.home()),
-           "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1"}
+           "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+           "GIT_TERMINAL_PROMPT": "0"}
     with tempfile.TemporaryFile() as output:
         try:
             process = subprocess.Popen([exe, *args], env=env,
                                        stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=subprocess.STDOUT,
-                                       close_fds=True, preexec_fn=child_limits)
+                                       close_fds=True, pass_fds=pass_fds,
+                                       preexec_fn=child_limits)
         except OSError as exc:
             return {"status": "launch_error", "type": type(exc).__name__}
         try:
@@ -259,15 +268,33 @@ def repo_state(path):
     if path is None:
         return {"status": "not_supplied"}
     folder = canonical(path)
-    if not folder.is_dir():
-        return {"status": "not_found"}
-    result = run("git", "-C", str(folder), "rev-parse", "--verify", "HEAD")
-    sha = result.get("output", "")
-    if result.get("exit_code") != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
-        return {"status": "not_a_checkout"}
-    changed = run("git", "-C", str(folder), "diff", "--quiet", "HEAD", "--")
-    return {"status": "identified", "head_sha": sha,
-            "tracked_changes": changed.get("exit_code") == 1}
+    try:
+        folder_fd = directory(folder)
+        git_fd = directory(folder / ".git")
+    except (FileNotFoundError, NotADirectoryError, Refusal):
+        return {"status": "not_found_or_untrusted"}
+    try:
+        checkout = f"/proc/self/fd/{folder_fd}"
+        git_options = ("-c", "core.fsmonitor=false",
+                       "-c", "core.hooksPath=/dev/null",
+                       "-c", "diff.external=")
+        inherited = (folder_fd, git_fd)
+        result = run("git", *git_options, "-C", checkout,
+                     "rev-parse", "--verify", "HEAD", pass_fds=inherited)
+        sha = result.get("output", "")
+        if (result.get("status") != "executed" or result.get("exit_code") != 0
+                or not re.fullmatch(r"[0-9a-f]{40}", sha)):
+            return {"status": "not_a_checkout_or_git_failed"}
+        changed = run("git", *git_options, "-C", checkout, "diff",
+                      "--no-ext-diff", "--no-textconv", "--quiet", "HEAD", "--",
+                      pass_fds=inherited)
+        if changed.get("status") != "executed" or changed.get("exit_code") not in (0, 1):
+            return {"status": "comparison_failed", "head_sha": sha}
+        return {"status": "identified", "head_sha": sha,
+                "tracked_changes": changed["exit_code"] == 1}
+    finally:
+        os.close(git_fd)
+        os.close(folder_fd)
 
 def capture(session, repo):
     uname = os.uname()
