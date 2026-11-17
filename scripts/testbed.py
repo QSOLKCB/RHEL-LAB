@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 #!/usr/bin/env python3
 """Local-only KVM/libvirt testbed. No guest boot, network, or sudo commands."""
 from __future__ import annotations
@@ -6,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import resource
 from functools import partial
 import re
@@ -13,6 +17,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,7 +49,7 @@ HELPER_PATHS = {
     "virsh": Path("/usr/bin/virsh"),
 }
 COMMAND_PATH = "/usr/bin"
-COMMAND_ENV_PASSTHROUGH = ("HOME", "XDG_RUNTIME_DIR")
+MAX_HELPER_OUTPUT = 1024 * 1024
 
 
 class TestbedError(ValueError):
@@ -478,21 +483,19 @@ def audit_xml(xml: str, cfg: dict, root: Path) -> None:
         raise TestbedError("disk or ISO missing")
 
 
-def _diagnostic(value: str | bytes | None) -> str:
-    """Retain captured negative-result text across subprocess error types."""
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="backslashreplace")
-    return value
-
-
-def _command_environment() -> dict[str, str]:
+def _command_environment(helper_name: str) -> dict[str, str]:
     environment = {"PATH": COMMAND_PATH, "LC_ALL": "C"}
-    for name in COMMAND_ENV_PASSTHROUGH:
-        value = os.environ.get(name)
-        if value is not None:
-            environment[name] = value
+    if helper_name == "virsh":
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        runtime_text = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
+        runtime = Path(runtime_text)
+        if not runtime.is_absolute() or ".." in runtime.parts:
+            raise TestbedError("XDG_RUNTIME_DIR must be an absolute trusted path")
+        with safe_fs.directory(home):
+            pass
+        with safe_fs.directory(runtime, private=True):
+            pass
+        environment.update({"HOME": str(home), "XDG_RUNTIME_DIR": str(runtime)})
     return environment
 
 
@@ -539,24 +542,59 @@ def local_command(helper: PinnedHelper, args: list[str], timeout: int = 30,
         extra["preexec_fn"] = partial(
             resource.setrlimit, resource.RLIMIT_FSIZE,
             (file_size_limit, file_size_limit))
+    read_fd, write_fd = os.pipe()
+    captured = bytearray()
+    truncated = False
+
+    def drain_output() -> None:
+        nonlocal truncated
+        try:
+            while True:
+                chunk = os.read(read_fd, 65536)
+                if not chunk:
+                    return
+                remaining = MAX_HELPER_OUTPUT - len(captured)
+                if remaining > 0:
+                    captured.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncated = True
+        finally:
+            os.close(read_fd)
+
+    reader = threading.Thread(target=drain_output, daemon=True)
+    process = None
     try:
-        result = subprocess.run(
-            argv, executable=f"/proc/self/fd/{helper.fd}", check=True,
-            timeout=timeout, capture_output=True, text=True,
-            pass_fds=inherited_fds, env=_command_environment(), **extra)
-    except subprocess.CalledProcessError as exc:
-        raise TestbedError(
-            f"{helper.path} returned exit status {exc.returncode}; "
-            f"captured stdout: {_diagnostic(exc.stdout)}; "
-            f"captured stderr: {_diagnostic(exc.stderr)}"
-        ) from exc
+        process = subprocess.Popen(
+            argv, executable=f"/proc/self/fd/{helper.fd}",
+            stdin=subprocess.DEVNULL, stdout=write_fd, stderr=subprocess.STDOUT,
+            pass_fds=inherited_fds, env=_command_environment(helper.name), **extra)
+    except BaseException:
+        os.close(write_fd)
+        os.close(read_fd)
+        raise
+    os.close(write_fd)
+    reader.start()
+    timed_out = None
+    try:
+        returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        timed_out = exc
+        process.kill()
+        returncode = process.wait()
+    finally:
+        reader.join()
+    output = bytes(captured).decode("utf-8", errors="backslashreplace")
+    if truncated:
+        output += "\n[output truncated at 1048576 bytes]"
+    if timed_out is not None:
         raise TestbedError(
-            f"{helper.path} timed out after {exc.timeout}s; "
-            f"captured stdout: {_diagnostic(exc.stdout)}; "
-            f"captured stderr: {_diagnostic(exc.stderr)}"
-        ) from exc
-    return result.stdout.strip()
+            f"{helper.path} timed out after {timed_out.timeout}s; "
+            f"captured output: {output}") from timed_out
+    if returncode != 0:
+        raise TestbedError(
+            f"{helper.path} returned exit status {returncode}; "
+            f"captured output: {output}")
+    return output.strip()
 
 
 def approve(value: str | None, expected: str) -> None:
@@ -783,7 +821,7 @@ def verify_media(root: Path) -> dict:
     media = verify_staged_iso(root)
     return {"status": "STAGED_ISO_VERIFIED", "iso": media["path"],
             "iso_sha256": media["sha256"], "bytes": media["bytes"],
-            "manual_next": f"virsh -c {URI} define {root / 'domain.xml'}"}
+            "manual_next": f"/usr/bin/virsh -c {URI} define {root / 'domain.xml'}"}
 
 
 def _audit_defined(cfg: dict, root: Path, virsh: PinnedHelper) -> dict:
@@ -815,7 +853,7 @@ def snapshot(cfg: dict, root: Path, label: str, sha: str,
     with pinned_helper("qemu-img") as qemu_img, \
             pinned_helper("virsh") as virsh, \
             safe_fs.lab_directory(root) as lab_fd:
-        source_fd = safe_fs.regular_at(lab_fd, "disk.qcow2")
+        source_fd = safe_fs.private_regular_at(lab_fd, "disk.qcow2")
         try:
             _audit_defined(cfg, root, virsh)
             state = local_command(
