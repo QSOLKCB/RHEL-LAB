@@ -69,6 +69,41 @@ class TestbedTests(unittest.TestCase):
         with self.assertRaises(t.TestbedError):
             t.read_config(self.config_path)
 
+    def test_config_size_limit_rejected_before_json_decode(self):
+        self.config_path.write_bytes(b" " * (t.MAX_CONFIG_BYTES + 1))
+        with self.assertRaisesRegex(t.TestbedError, "64 KiB"):
+            t.read_config(self.config_path)
+
+    def test_config_invalid_utf8_is_rejected(self):
+        self.config_path.write_bytes(b"\\xff")
+        with self.assertRaises(t.TestbedError):
+            t.read_config(self.config_path)
+
+    def test_config_nonfinite_json_constant_rejected(self):
+        self.config_path.write_text(json.dumps(self.cfg).replace(
+            '"vcpus": 2', '"vcpus": NaN'))
+        with self.assertRaises(t.TestbedError):
+            t.read_config(self.config_path)
+
+    def test_config_symlink_rejected(self):
+        link = self.base / "linked-config.json"
+        link.symlink_to(self.config_path)
+        with self.assertRaises((t.TestbedError, safe_fs.UnsafePath, OSError)):
+            t.read_config(link)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO only")
+    def test_fifo_config_rejected_without_open(self):
+        fifo = self.base / "config.fifo"
+        os.mkfifo(fifo)
+        with patch("scripts.safe_fs.os.open", wraps=os.open) as opened:
+            with self.assertRaises(safe_fs.UnsafePath):
+                t.read_config(fifo)
+            # Opening ancestor directories is expected, but the FIFO itself
+            # must be rejected by lstat before any attempt to open its name.
+            self.assertFalse(any(
+                call.args and call.args[0] == fifo.name
+                for call in opened.call_args_list))
+
     def test_main_escapes_terminal_controls_in_config_error(self):
         from contextlib import redirect_stderr
         from io import StringIO
