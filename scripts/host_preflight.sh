@@ -275,7 +275,6 @@ def capture(session, repo):
                           small_file("/proc/modules", 262144).splitlines()
                           if row.split() and row.split()[0].startswith("kvm")})
     commands = {
-        "python": ("python3", "--version"),
         "uv": ("uv", "--version"),
         "git": ("git", "--version"),
         "qemu_img": ("qemu-img", "--version"),
@@ -303,7 +302,9 @@ def capture(session, repo):
         "security": {
             "kernel_lockdown": small_file("/sys/kernel/security/lockdown", 1024).strip() or "unavailable",
             "apparmor_kernel": small_file("/sys/module/apparmor/parameters/enabled", 128).strip() or "unavailable"},
-        "tools": {label: run(*args) for label, args in commands.items()},
+        "tools": {**{label: run(*args) for label, args in commands.items()},
+                  "python": {"status": "running_interpreter",
+                             "version": sys.version.split()[0]}},
         "packages": run("dpkg-query", "-W", *packages),
         "repository": repo_state(repo),
     }
