@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 #!/usr/bin/env python3
 """Fail-closed, offline GitHub Pages policy check for QSOLKCB/RHEL-LAB.
 
@@ -25,7 +28,18 @@ PUBLISH_MARKERS = (
     re.compile(r"""(?im)^[ \t]*["']?pages["']?[ \t]*:[ \t]*["']?write["']?(?=[ \t]*(?:#|$))"""),
     re.compile(r"""(?i)[,{][ \t\r\n]*["']?pages["']?[ \t]*:[ \t]*["']?write["']?(?=[ \t]*(?:,|\}|#|$))"""),
     re.compile(r"\bgh-pages\b", re.I),
+    re.compile(r"(?im)^[ \t]*permissions[ \t]*:[ \t]*[\"']?write-all[\"']?(?:[ \t]*(?:#.*)?)$"),
+    re.compile(r"(?im)^[ \t]*[a-z][a-z-]*[ \t]*:[ \t]*[\"']?write[\"']?(?:[ \t]*(?:#.*)?)$"),
+    re.compile(r"(?i)\b(?:api\.github\.com/repos/[^\s]+/pages|/pages/builds|/pages/deployment)\b"),
 )
+
+ALLOWED_ACTIONS = frozenset({
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",  # v7.0.1
+    "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",  # v7.0.0
+})
+USES = re.compile(r"(?im)^[ \t]*-[ \t]*uses[ \t]*:[ \t]*([^#\r\n]+)")
+TOP_LEVEL_READ = re.compile(
+    r"(?m)^permissions:[ \t]*(?:\r?\n)[ \t]+contents:[ \t]*[\"']?read[\"']?(?:[ \t]*(?:#.*)?)$")
 
 
 _YAML_SIMPLE_ESCAPES = {
@@ -119,6 +133,14 @@ def check(event: object, repository: str, workflows: Path) -> None:
         canonical = _canonicalize_yaml_escapes(active)
         if any(marker.search(canonical) for marker in PUBLISH_MARKERS):
             raise PolicyError(f"Pages deployment reference in {path.name!r}")
+        if TOP_LEVEL_READ.search(canonical) is None:
+            raise PolicyError(
+                f"workflow lacks explicit top-level contents: read permissions: {path.name!r}")
+        for match in USES.finditer(canonical):
+            action = match.group(1).strip().strip("\"'")
+            if action not in ALLOWED_ACTIONS:
+                raise PolicyError(
+                    f"unapproved local, reusable, or third-party action in {path.name!r}")
 
 
 def main(argv: list[str] | None = None) -> int:
