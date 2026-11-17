@@ -1,13 +1,17 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 # Daybreak Defense Factory — staged security gate
 
-**Status (2026-11-18): NOT CLEARED FOR LIVE RHEL EXPERIMENTS.** Six completed Daybreak repository scans were recorded. The newest completed scan (`wfr_bb281a48fdcfd85b076cd03dbb76b1ecd3761596b0b9d050c7bbf7947f6ac311`) targeted `4d4827af3aad0fcd4fafec891dc8e02a8c6d0215`, not the then-current main `dabb6a29304f99e403b6dbb1154983dacde3cc6d` or the new draft PRs. A green CI run is not proof of host isolation.
+**Status (2026-11-18): NOT CLEARED FOR LIVE RHEL EXPERIMENTS.** The newest completed Daybreak repository scan (`wfr_5b1b1f7872aa10f7c5d709ab538289569c0d0e69a28b6f947794a90fd054f33e`) targeted the then-current main `347aa5748318172e8dbf265e9c2874fc14029936` and reported 13 observations. The remediation branch combines the later QCOW2/storage work with fixes for the remaining findings. A green CI run is not proof of host isolation; the final merged head still requires a fresh scan.
 
 ## Reconciled observations
 
 - `acf_2e6e3a40f0a8fc363ee8f78eee67566f`: evidence-tree traversal could consume resources before limiting file count or hashing. Draft PR #17 applies the saved bounded-work fix. Merged PR #14 concerned **manifest decoding**, a different boundary.
-- The Pages status check currently runs candidate-controlled code. A required independent check must execute a trusted-base validator, not scripts checked out from the PR.
+- Before this remediation, the Pages status check ran candidate-controlled code. The independent check must continue to execute a trusted-base validator, not scripts checked out from the PR.
+- Pull-request code must not execute on a network-capable hosted runner. The remediation workflow limits PR handling to trusted-base policy code inspecting candidate workflows as inert data; Python tests run after merge or by explicit dispatch.
 - `acf_3358dca947560d3c7aa45a5db7845a61`: prior PATH-helper issue already has pinned trusted helpers; PR #13 was closed without merging as obsolete. Do not reapply that fix.
-- The audit additionally found a blocking unprotected main branch, ISO and snapshot storage-budget gaps, QCOW2 external-file/header inspection gaps, unbounded subprocess capture, and FIFO config reads. Draft PR #16 addresses the config boundary only.
+- The audit additionally found a blocking unprotected main branch, ISO and snapshot storage-budget gaps, QCOW2 external-file/header inspection gaps, unbounded subprocess capture, unsafe ambient libvirt state, and provenance/host-preflight trust gaps. Source fixes do not replace the administrator-owned branch ruleset gate.
 
 ## Mandatory gates before any RHEL guest runs
 
