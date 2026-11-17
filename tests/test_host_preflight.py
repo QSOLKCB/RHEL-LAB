@@ -69,8 +69,9 @@ class HostPreflightTests(unittest.TestCase):
 
     def test_symlink_session_rejected(self):
         session = self.before()
-        linked = self.root / "linked"
+        linked = self.root / ("a" * 24)
         linked.symlink_to(session, target_is_directory=True)
         result = self.invoke("--phase", "verify", "--session", str(linked),
                              success=False)
         self.assertIn("FAIL:", result.stderr)
+        self.assertNotIn("invalid session ID", result.stderr)
