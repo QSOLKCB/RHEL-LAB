@@ -19,7 +19,7 @@ class EvidenceTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.data = self.base / "data"
-        self.data.mkdir()
+        self.data.mkdir(mode=0o700)
         (self.data / "z.log").write_bytes(b"last\n")
         (self.data / "a.log").write_bytes(b"first\n")
         self.manifest = self.base / "manifest.json"
@@ -145,8 +145,41 @@ class EvidenceTests(unittest.TestCase):
     def test_public_manifest_parent_is_rejected(self) -> None:
         public = self.base / "public"
         public.mkdir(mode=0o755)
+        public.chmod(0o755)
         with self.assertRaises(UnsafePath):
             seal(self.data, public / "manifest.json")
+
+    def test_inventory_rejects_public_input_root(self) -> None:
+        for mode in (0o755, 0o750):
+            with self.subTest(mode=oct(mode)):
+                self.data.chmod(mode)
+                try:
+                    with self.assertRaises(UnsafePath):
+                        inventory(self.data)
+                finally:
+                    self.data.chmod(0o700)
+
+    def test_seal_rejects_public_input_root(self) -> None:
+        for mode in (0o755, 0o750):
+            with self.subTest(mode=oct(mode)):
+                self.data.chmod(mode)
+                try:
+                    with self.assertRaises(UnsafePath):
+                        seal(self.data, self.manifest)
+                finally:
+                    self.data.chmod(0o700)
+        self.assertFalse(self.manifest.exists())
+
+    def test_verify_rejects_public_input_root(self) -> None:
+        seal(self.data, self.manifest)
+        for mode in (0o755, 0o750):
+            with self.subTest(mode=oct(mode)):
+                self.data.chmod(mode)
+                try:
+                    with self.assertRaises(UnsafePath):
+                        verify(self.data, self.manifest)
+                finally:
+                    self.data.chmod(0o700)
 
     def test_raced_symlink_never_hashes_outside_file(self) -> None:
         victim = self.data / "a.log"
