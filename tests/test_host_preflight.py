@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 """Safe host preflight checks: no sudo, package mutation, network, or VM."""
 from __future__ import annotations
 
