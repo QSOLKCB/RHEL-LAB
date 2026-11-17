@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -39,9 +40,25 @@ class TestbedTests(unittest.TestCase):
         }
         self.config_path = self.base / "config.json"
         self.write_config()
+        # CI fixtures do not have 48 GiB free disk.
+        # Headroom refusal is independently exercised in test_media_guard.py.
+        budget = patch.object(t.media_guard, "require_headroom")
+        budget.start()
+        self.addCleanup(budget.stop)
+
 
     def write_config(self):
         self.config_path.write_text(json.dumps(self.cfg), encoding="utf-8")
+
+    def qcow2_fixture(self):
+        """Minimal structurally valid, standalone QCOW2 v3 fixture (not bootable)."""
+        header = bytearray(512)
+        header[:4] = b"QFI\xfb"
+        struct.pack_into(">I", header, 4, 3)
+        struct.pack_into(">I", header, 20, 9)
+        struct.pack_into(">Q", header, 24, self.cfg["disk_gib"] * 1024 ** 3)
+        struct.pack_into(">I", header, 100, 104)
+        return bytes(header)
 
     def test_valid_profile(self):
         self.assertEqual(t.read_config(self.config_path), self.cfg)
@@ -428,10 +445,10 @@ class TestbedTests(unittest.TestCase):
         self.assertFalse(self.root.exists())
 
     def test_prepare_never_defines_or_boots_vm(self):
-        def fake_qemu(helper, args, timeout=30, pass_fds=()):
+        def fake_qemu(helper, args, timeout=30, pass_fds=(), file_size_limit=None):
             self.assertEqual(helper.path, self.helper_paths["qemu-img"])
             self.assertEqual(args[:3], ["create", "-f", "qcow2"])
-            Path(args[3]).write_bytes(b"simulated image")
+            Path(args[3]).write_bytes(self.qcow2_fixture())
             return ""
         with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
                 patch.object(t, "local_command", side_effect=fake_qemu):
@@ -457,10 +474,10 @@ class TestbedTests(unittest.TestCase):
     def test_source_replacement_does_not_change_staged_media(self):
         original = self.iso.read_bytes()
 
-        def fake_qemu(helper, args, timeout=30, pass_fds=()):
+        def fake_qemu(helper, args, timeout=30, pass_fds=(), file_size_limit=None):
             self.iso.unlink()
             self.iso.write_bytes(b"replacement media")
-            Path(args[3]).write_bytes(b"simulated image")
+            Path(args[3]).write_bytes(self.qcow2_fixture())
             return ""
 
         with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
@@ -472,8 +489,8 @@ class TestbedTests(unittest.TestCase):
         self.assertNotIn(str(self.iso), definition)
 
     def test_changed_staged_media_is_rejected(self):
-        def fake_qemu(helper, args, timeout=30, pass_fds=()):
-            Path(args[3]).write_bytes(b"simulated image")
+        def fake_qemu(helper, args, timeout=30, pass_fds=(), file_size_limit=None):
+            Path(args[3]).write_bytes(self.qcow2_fixture())
             return ""
 
         with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
@@ -484,8 +501,8 @@ class TestbedTests(unittest.TestCase):
             t.verify_media(self.root)
 
     def test_replaced_staged_inode_is_rejected(self):
-        def fake_qemu(helper, args, timeout=30, pass_fds=()):
-            Path(args[3]).write_bytes(b"simulated image")
+        def fake_qemu(helper, args, timeout=30, pass_fds=(), file_size_limit=None):
+            Path(args[3]).write_bytes(self.qcow2_fixture())
             return ""
 
         with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
@@ -547,12 +564,12 @@ class TestbedTests(unittest.TestCase):
         attacker = self.base / "outside"
         attacker.mkdir(mode=0o700)
 
-        def raced_qemu(helper, args, timeout=30, pass_fds=()):
+        def raced_qemu(helper, args, timeout=30, pass_fds=(), file_size_limit=None):
             self.assertEqual(args[:3], ["create", "-f", "qcow2"])
             self.assertEqual(len(pass_fds), 1)
             self.root.rename(moved)
             self.root.symlink_to(attacker, target_is_directory=True)
-            Path(args[3]).write_bytes(b"simulated image")
+            Path(args[3]).write_bytes(self.qcow2_fixture())
             return ""
 
         with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
@@ -575,17 +592,17 @@ class TestbedTests(unittest.TestCase):
 
     def test_offline_snapshot_receipt_is_private(self):
         self.root.mkdir(mode=0o700)
-        (self.root / "disk.qcow2").write_bytes(b"fake disk")
+        (self.root / "disk.qcow2").write_bytes(self.qcow2_fixture())
 
-        def fake_command(helper, args, timeout=30, pass_fds=()):
+        def fake_command(helper, args, timeout=30, pass_fds=(), file_size_limit=None):
             if helper.name == "virsh" and args[:1] == ["-c"]:
                 return "shut off"
             if helper.name == "qemu-img" and args[:1] == ["info"]:
                 self.assertTrue(pass_fds)
-                return '{"format":"qcow2"}'
+                return json.dumps({"format": "qcow2", "virtual-size": self.cfg["disk_gib"] * 1024 ** 3})
             if helper.name == "qemu-img" and args[:1] == ["convert"]:
                 self.assertEqual(len(pass_fds), 2)
-                Path(args[-1]).write_bytes(b"converted evidence")
+                Path(args[-1]).write_bytes(self.qcow2_fixture())
                 return ""
             self.fail(f"unexpected command: {helper.name} {args}")
 
@@ -597,7 +614,7 @@ class TestbedTests(unittest.TestCase):
         receipt = Path(result["receipt"])
         image = Path(result["image"])
         self.assertTrue(image.is_file())
-        self.assertEqual(image.read_bytes(), b"converted evidence")
+        self.assertEqual(image.read_bytes(), self.qcow2_fixture())
         self.assertEqual(os.stat(receipt).st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(receipt.read_text())["sha256"], result["sha256"])
         self.assertEqual(json.loads(receipt.read_text())["claim"], "OFFLINE_DISK_COPY_ONLY")
