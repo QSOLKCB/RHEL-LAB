@@ -75,7 +75,7 @@ class TestbedTests(unittest.TestCase):
             t.read_config(self.config_path)
 
     def test_config_invalid_utf8_is_rejected(self):
-        self.config_path.write_bytes(b"\\xff")
+        self.config_path.write_bytes(bytes([0xff]))
         with self.assertRaises(t.TestbedError):
             t.read_config(self.config_path)
 
@@ -418,7 +418,7 @@ class TestbedTests(unittest.TestCase):
         alias = self.helper_dir / "virsh-link"
         alias.symlink_to(self.helper_paths["virsh"])
         with patch.dict(t.HELPER_PATHS, {"virsh": alias}, clear=True):
-            with self.assertRaises(OSError):
+            with self.assertRaises((OSError, safe_fs.UnsafePath)):
                 with t.pinned_helper("virsh"):
                     self.fail("symlinked helper was accepted")
 
@@ -569,7 +569,7 @@ class TestbedTests(unittest.TestCase):
         outside.write_bytes(b"secret")
         (self.root / "disk.qcow2").symlink_to(outside)
         with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True):
-            with self.assertRaises(OSError):
+            with self.assertRaises((OSError, safe_fs.UnsafePath)):
                 t.snapshot(self.cfg, self.root, "baseline", "a" * 40,
                            t.SNAPSHOT_TOKEN)
 
