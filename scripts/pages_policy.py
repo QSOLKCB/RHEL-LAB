@@ -28,6 +28,75 @@ PUBLISH_MARKERS = (
 )
 
 
+_YAML_SIMPLE_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\x85",
+    "_": "\xa0",
+    "L": "\u2028",
+    "P": "\u2029",
+}
+_YAML_HEX_ESCAPES = {"x": 2, "u": 4, "U": 8}
+
+
+def _canonicalize_yaml_escapes(source: str) -> str:
+    """Decode YAML double-quoted escape spellings for fail-closed scanning.
+
+    The scan deliberately canonicalizes escapes wherever they occur rather
+    than trying to implement YAML's context-sensitive grammar. This can only
+    expose additional publishing markers; ordinary unescaped text is
+    unchanged. Backslash pairs are consumed once so escapes are not decoded
+    recursively.
+    """
+    canonical: list[str] = []
+    index = 0
+    while index < len(source):
+        if source[index] != "\\" or index + 1 == len(source):
+            canonical.append(source[index])
+            index += 1
+            continue
+
+        escape = source[index + 1]
+        if escape in _YAML_SIMPLE_ESCAPES:
+            canonical.append(_YAML_SIMPLE_ESCAPES[escape])
+            index += 2
+            continue
+        if escape in _YAML_HEX_ESCAPES:
+            width = _YAML_HEX_ESCAPES[escape]
+            digits = source[index + 2:index + 2 + width]
+            if len(digits) == width and all(
+                    character in "0123456789abcdefABCDEF"
+                    for character in digits):
+                value = int(digits, 16)
+                if value <= 0x10ffff:
+                    canonical.append(chr(value))
+                    index += 2 + width
+                    continue
+        if escape in "\r\n":
+            index += 2
+            if escape == "\r" and index < len(source) \
+                    and source[index] == "\n":
+                index += 1
+            while index < len(source) and source[index] in " \t":
+                index += 1
+            continue
+
+        canonical.append("\\")
+        index += 1
+    return "".join(canonical)
+
+
 def check(event: object, repository: str, workflows: Path) -> None:
     if repository != "QSOLKCB/RHEL-LAB":
         raise PolicyError("incorrect repository for RHEL-LAB guard")
@@ -47,7 +116,8 @@ def check(event: object, repository: str, workflows: Path) -> None:
             line for line in path.read_text(encoding="utf-8").splitlines()
             if not line.lstrip().startswith("#")
         )
-        if any(marker.search(active) for marker in PUBLISH_MARKERS):
+        canonical = _canonicalize_yaml_escapes(active)
+        if any(marker.search(canonical) for marker in PUBLISH_MARKERS):
             raise PolicyError(f"Pages deployment reference in {path.name!r}")
 
 

@@ -8,7 +8,8 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
+from xml.etree import ElementTree as ET
 
 from scripts import testbed as t
 from scripts import safe_fs
@@ -147,6 +148,114 @@ class TestbedTests(unittest.TestCase):
         xml = xml.replace('<memory unit="MiB">4096</memory>',
                           '<memory unit="KiB">4194304</memory>')
         t.audit_xml(xml, self.cfg, self.root)
+
+    def test_reviewed_libvirt_normalization_allowed(self):
+        domain = ET.fromstring(t.render_xml(self.cfg, self.root))
+        domain.set("id", "7")
+        ET.SubElement(domain, "uuid").text = "12345678-1234-4234-8234-123456789abc"
+        ET.SubElement(domain, "currentMemory", {"unit": "KiB"}).text = "4194304"
+        domain.find("vcpu").set("placement", "static")
+        domain.find("os/type").set("machine", "pc-q35-rhel9.6.0")
+        features = ET.SubElement(domain, "features")
+        ET.SubElement(features, "acpi")
+        ET.SubElement(features, "apic")
+        cpu = ET.SubElement(domain, "cpu", {"mode": "custom", "match": "exact",
+                                             "check": "none"})
+        ET.SubElement(cpu, "model", {"fallback": "forbid"}).text = "qemu64"
+        clock = ET.SubElement(domain, "clock", {"offset": "utc"})
+        ET.SubElement(clock, "timer", {"name": "rtc", "tickpolicy": "catchup"})
+        ET.SubElement(domain, "on_poweroff").text = "destroy"
+        ET.SubElement(domain, "on_reboot").text = "restart"
+        ET.SubElement(domain, "on_crash").text = "destroy"
+        pm = ET.SubElement(domain, "pm")
+        ET.SubElement(pm, "suspend-to-mem", {"enabled": "no"})
+        ET.SubElement(pm, "suspend-to-disk", {"enabled": "no"})
+        seclabel = ET.SubElement(domain, "seclabel", {
+            "type": "dynamic", "model": "selinux", "relabel": "yes"})
+        ET.SubElement(seclabel, "label").text = "system_u:system_r:svirt_t:s0:c1,c2"
+        ET.SubElement(seclabel, "imagelabel").text = "system_u:object_r:svirt_image_t:s0:c1,c2"
+        devices = domain.find("devices")
+        for index, disk in enumerate(devices.findall("disk"), start=1):
+            disk.find("source").set("index", str(index))
+            ET.SubElement(disk, "backingStore")
+            ET.SubElement(disk, "alias", {"name": f"disk{index}"})
+        serial = devices.find("serial")
+        ET.SubElement(serial, "source", {"path": "/dev/pts/7"})
+        serial.find("target").set("type", "isa-serial")
+        ET.SubElement(serial.find("target"), "model", {"name": "isa-serial"})
+        console = devices.find("console")
+        console.set("tty", "/dev/pts/7")
+        ET.SubElement(console, "source", {"path": "/dev/pts/7"})
+        controller = ET.SubElement(devices, "controller", {
+            "type": "sata", "index": "0"})
+        ET.SubElement(controller, "alias", {"name": "sata0"})
+        input_device = ET.SubElement(devices, "input", {"type": "mouse", "bus": "ps2"})
+        ET.SubElement(input_device, "alias", {"name": "input0"})
+        video = ET.SubElement(devices, "video")
+        ET.SubElement(video, "model", {"type": "vga", "vram": "16384", "heads": "1"})
+        balloon = ET.SubElement(devices, "memballoon", {"model": "virtio"})
+        ET.SubElement(balloon, "stats", {"period": "10"})
+        ET.SubElement(devices, "emulator").text = "/usr/libexec/qemu-kvm"
+        t.audit_xml(ET.tostring(domain, encoding="unicode"), self.cfg, self.root)
+
+    def test_network_disk_backing_rejected(self):
+        xml = t.render_xml(self.cfg, self.root)
+        backing = ("<backingStore type='network'><format type='qcow2'/>"
+                   "<source protocol='nbd' name='remote'><host name='example.invalid' "
+                   "port='10809'/></source></backingStore>")
+        xml = xml.replace("</disk>", backing + "</disk>", 1)
+        with self.assertRaises(t.TestbedError):
+            t.audit_xml(xml, self.cfg, self.root)
+
+    def test_disk_security_extensions_rejected(self):
+        for extension in (
+            "<mirror type='network'/>",
+            "<dataStore type='network'/>",
+            "<auth username='attacker'/>",
+            "<reservations managed='yes'/>",
+            "<encryption format='luks'/>",
+        ):
+            with self.subTest(extension=extension):
+                xml = t.render_xml(self.cfg, self.root)
+                xml = xml.replace("</disk>", extension + "</disk>", 1)
+                with self.assertRaises(t.TestbedError):
+                    t.audit_xml(xml, self.cfg, self.root)
+
+    def test_host_backed_boot_elements_rejected(self):
+        for extension in (
+            "<loader>/tmp/untrusted-firmware.fd</loader>",
+            "<nvram>/tmp/untrusted-vars.fd</nvram>",
+            "<kernel>/tmp/untrusted-kernel</kernel>",
+            "<initrd>/tmp/untrusted-initrd</initrd>",
+        ):
+            with self.subTest(extension=extension):
+                xml = t.render_xml(self.cfg, self.root)
+                xml = xml.replace("</os>", extension + "</os>")
+                with self.assertRaises(t.TestbedError):
+                    t.audit_xml(xml, self.cfg, self.root)
+
+    def test_unapproved_domain_semantics_rejected(self):
+        for extension in (
+            "<memoryBacking><source type='file'/></memoryBacking>",
+            "<seclabel type='static' model='selinux' relabel='no'>"
+            "<label>unconfined_u:unconfined_r:unconfined_t:s0</label></seclabel>",
+            "<seclabel type='dynamic' model='selinux' relabel='yes'>"
+            "<label>unconfined_u:unconfined_r:unconfined_t:s0</label>"
+            "<imagelabel>unconfined_u:object_r:svirt_image_t:s0</imagelabel></seclabel>",
+        ):
+            with self.subTest(extension=extension):
+                xml = t.render_xml(self.cfg, self.root)
+                xml = xml.replace("</domain>", extension + "</domain>")
+                with self.assertRaises(t.TestbedError):
+                    t.audit_xml(xml, self.cfg, self.root)
+
+    def test_video_render_node_rejected(self):
+        xml = t.render_xml(self.cfg, self.root)
+        video = ("<video><model type='virtio'><acceleration accel3d='yes' "
+                 "rendernode='/dev/dri/renderD128'/></model></video>")
+        xml = xml.replace("</devices>", video + "</devices>")
+        with self.assertRaises(t.TestbedError):
+            t.audit_xml(xml, self.cfg, self.root)
 
     def test_file_path_substitution_rejected(self):
         xml = t.render_xml(self.cfg, self.root)

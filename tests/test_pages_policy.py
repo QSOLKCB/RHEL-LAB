@@ -77,6 +77,19 @@ class PagesPolicyTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError):
             policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
+    def test_escaped_pages_permissions_rejected(self):
+        path = self.workflows / "escaped.yml"
+        cases = (
+            'permissions:\n  "pa\\u0067es": write\n',
+            'permissions: {"pages": "wri\\x74e"}\n',
+        )
+        for contents in cases:
+            with self.subTest(contents=contents):
+                path.write_text(contents, encoding="utf-8")
+                with self.assertRaises(policy.PolicyError):
+                    policy.check(self.event, "QSOLKCB/RHEL-LAB",
+                                 self.workflows)
+
     def test_similar_permission_value_not_rejected(self):
         (self.workflows / "other.yml").write_text(
             'permissions: {pages: readonly, contents: read}\n',
@@ -89,11 +102,39 @@ class PagesPolicyTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError):
             policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
+    def test_escaped_deployment_actions_rejected(self):
+        path = self.workflows / "escaped.yaml"
+        cases = (
+            'steps:\n  - uses: "actions/deploy-pa\\u0067es@v4"\n',
+            'steps:\n  - uses: "actions\\/upload-pages-artifact@v3"\n',
+            'steps:\n  - uses: "peaceiris/actions-gh-pa\\x67es@v4"\n',
+            'steps:\n  - uses: "actions/deploy-pa\\\n      ges@v4"\n',
+        )
+        for contents in cases:
+            with self.subTest(contents=contents):
+                path.write_text(contents, encoding="utf-8")
+                with self.assertRaises(policy.PolicyError):
+                    policy.check(self.event, "QSOLKCB/RHEL-LAB",
+                                 self.workflows)
+
     def test_gh_pages_branch_rejected(self):
         (self.workflows / "bad.yml").write_text(
             "run: git push origin HEAD:gh-pages\n", encoding="utf-8")
         with self.assertRaises(policy.PolicyError):
             policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_escaped_gh_pages_branch_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            'run: "git push origin HEAD:gh-\\U00000070ages"\n',
+            encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_escaped_backslash_is_not_recursively_decoded(self):
+        (self.workflows / "safe.yml").write_text(
+            'run: "printf actions\\\\u002fdeploy-pages@v4"\n',
+            encoding="utf-8")
+        policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
     def test_comment_alone_not_a_publishing_workflow(self):
         (self.workflows / "safe.yaml").write_text(
