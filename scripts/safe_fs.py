@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 """Pinned, no-follow directory helpers for local-only research storage."""
 from __future__ import annotations
 
