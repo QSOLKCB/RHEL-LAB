@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 """Pure, offline regression checks for the no-Pages repository policy."""
 from __future__ import annotations
 
@@ -52,6 +55,33 @@ class PagesPolicyTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError):
             policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
+    def test_write_all_permission_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions: write-all\n", encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_unapproved_action_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions:\n  contents: read\nsteps:\n"
+            "  - uses: ./.github/actions/publish\n", encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_missing_explicit_read_permissions_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "name: inherits repository defaults\n", encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_direct_pages_api_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions:\n  contents: read\nsteps:\n"
+            "  - run: curl https://api.github.com/repos/o/r/pages\n",
+            encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
     def test_inline_pages_write_permission_rejected(self):
         (self.workflows / "inline.yml").write_text(
             "permissions: {pages: write}\n", encoding="utf-8")
@@ -92,7 +122,7 @@ class PagesPolicyTests(unittest.TestCase):
 
     def test_similar_permission_value_not_rejected(self):
         (self.workflows / "other.yml").write_text(
-            'permissions: {pages: readonly, contents: read}\n',
+            "permissions:\n  contents: read\n  pages: readonly\n",
             encoding="utf-8")
         policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
@@ -132,13 +162,15 @@ class PagesPolicyTests(unittest.TestCase):
 
     def test_escaped_backslash_is_not_recursively_decoded(self):
         (self.workflows / "safe.yml").write_text(
+            'permissions:\n  contents: read\n'
             'run: "printf actions\\\\u002fdeploy-pages@v4"\n',
             encoding="utf-8")
         policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
     def test_comment_alone_not_a_publishing_workflow(self):
         (self.workflows / "safe.yaml").write_text(
-            "# This workflow never calls actions/deploy-pages@v4\nname: Safe\n",
+            "# This workflow never calls actions/deploy-pages@v4\n"
+            "name: Safe\npermissions:\n  contents: read\n",
             encoding="utf-8")
         policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
