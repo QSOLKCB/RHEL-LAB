@@ -35,6 +35,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 MEDIA_SCHEMA = "qsol-rhel-staged-media/v1"
 STAGED_ISO = "installer.iso"
 MEDIA_RECEIPT = "installer.iso.receipt.json"
+MAX_CONFIG_BYTES = 64 * 1024
 HELPER_PATHS = {
     "qemu-img": Path("/usr/bin/qemu-img"),
     "virsh": Path("/usr/bin/virsh"),
@@ -67,9 +68,37 @@ def _pairs(items: list[tuple[str, object]]) -> dict:
     return out
 
 
+def _reject_nonfinite_constant(value: str) -> None:
+    raise TestbedError(f"non-finite JSON constant is forbidden: {value}")
+
+
 def read_config(path: Path) -> dict:
-    with path.open(encoding="utf-8") as stream:
-        cfg = json.load(stream, object_pairs_hook=_pairs)
+    """Parse a bounded, trusted regular config without following symlinks or FIFOs."""
+    with safe_fs.trusted_regular(path) as fd:
+        before = os.fstat(fd)
+        if before.st_size > MAX_CONFIG_BYTES:
+            raise TestbedError("configuration exceeds 64 KiB size limit")
+        chunks: list[bytes] = []
+        read_count = 0
+        while read_count <= MAX_CONFIG_BYTES:
+            chunk = os.read(fd, min(4096, MAX_CONFIG_BYTES + 1 - read_count))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            read_count += len(chunk)
+        if read_count > MAX_CONFIG_BYTES:
+            raise TestbedError("configuration exceeds 64 KiB size limit")
+        after = os.fstat(fd)
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size,
+                              s.st_mtime_ns, s.st_ctime_ns)
+        if read_count != before.st_size or identity(before) != identity(after):
+            raise TestbedError("configuration changed while reading")
+    try:
+        cfg = json.loads(b"".join(chunks).decode("utf-8"),
+                         object_pairs_hook=_pairs,
+                         parse_constant=_reject_nonfinite_constant)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise TestbedError("configuration is not valid bounded UTF-8 JSON") from exc
     fields = {"schema", "name", "architecture", "network", "vcpus",
               "memory_mib", "disk_gib"}
     if not isinstance(cfg, dict) or set(cfg) != fields:
