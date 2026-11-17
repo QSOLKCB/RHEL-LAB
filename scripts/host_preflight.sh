@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 #!/bin/bash
 # QSOL-IMC RHEL-LAB: offline host state and before/after SHA-256 receipts.
 # Run as an unprivileged user. NO sudo, installs, networking or VM actions.
