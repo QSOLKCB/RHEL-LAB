@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 # RHEL-LAB-002 — The Virtual Testbed
 
 This milestone supplies an offline-first *host-side implementation*, not a preinstalled RHEL guest. No VM, kernel experiment, Red Hat service or Daybreak scan is executed in GitHub Actions. The testbed runs only on an operator-owned Linux host, after explicit approval.
@@ -50,9 +53,9 @@ Inspect domain.xml and the staged-media receipt. Then re-open the private media 
 
 Only after that check succeeds and the owner explicitly authorizes this VM, manually define and boot it with the user libvirt connection:
 
-    virsh -c qemu:///session define "$LAB/domain.xml"
-    virsh -c qemu:///session start rhel-lab-offline-01
-    virsh -c qemu:///session console rhel-lab-offline-01
+    /usr/bin/virsh -c qemu:///session define "$LAB/domain.xml"
+    /usr/bin/virsh -c qemu:///session start rhel-lab-offline-01
+    /usr/bin/virsh -c qemu:///session console rhel-lab-offline-01
 
 The console is serial-only; the selected RHEL installer must support or be configured for serial/text installation (for example, console=ttyS0 and inst.text via the ISO's own boot configuration). If your ISO does not support that boot path, stop and make a reviewed change rather than adding a public graphics listener or a network adapter.
 
@@ -66,8 +69,8 @@ Re-run this after installation, host/libvirt configuration changes and before ea
 
 First shut down the guest cleanly and establish that **no other process is writing its disk**. This step is mandatory. A guest-state check alone cannot prevent a process from starting the VM while copying; coordinate exclusive ownership of the host during conversion.
 
-    virsh -c qemu:///session shutdown rhel-lab-offline-01
-    virsh -c qemu:///session domstate rhel-lab-offline-01
+    /usr/bin/virsh -c qemu:///session shutdown rhel-lab-offline-01
+    /usr/bin/virsh -c qemu:///session domstate rhel-lab-offline-01
 
 Only when it reports shut off and an approved exclusive offline window exists, take a copy of its standalone QCOW2 disk:
 
