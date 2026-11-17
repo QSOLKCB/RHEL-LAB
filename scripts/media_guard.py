@@ -10,7 +10,7 @@ import stat
 
 GIB = 1024 ** 3
 MAX_DISK_GIB = 64
-MAX_ISO_BYTES = 8 * GIB
+MAX_ISO_BYTES = 16 * GIB
 MIN_FREE_BYTES = 8 * GIB
 MAX_QCOW2_OVERHEAD_BYTES = 4 * GIB
 QFI_MAGIC = b"QFI\xfb"
@@ -25,7 +25,7 @@ class MediaError(ValueError):
 def iso_size(fd: int) -> int:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_ISO_BYTES:
-        raise MediaError("installer ISO must be regular, nonempty and at most 8 GiB")
+        raise MediaError("installer ISO must be regular, nonempty and at most 16 GiB")
     return info.st_size
 
 
