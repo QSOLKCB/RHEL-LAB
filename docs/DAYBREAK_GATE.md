@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 # Daybreak Defense Factory — staged security gate
 
 **Status (2026-11-18): NOT CLEARED FOR LIVE RHEL EXPERIMENTS.** The newest completed Daybreak repository scan (`wfr_5b1b1f7872aa10f7c5d709ab538289569c0d0e69a28b6f947794a90fd054f33e`) targeted the then-current main `347aa5748318172e8dbf265e9c2874fc14029936` and reported 13 observations. The remediation branch combines the later QCOW2/storage work with fixes for the remaining findings. A green CI run is not proof of host isolation; the final merged head still requires a fresh scan.
