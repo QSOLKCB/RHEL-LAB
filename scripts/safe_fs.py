@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 """Pinned, no-follow directory helpers for local-only research storage."""
 from __future__ import annotations
 
@@ -124,6 +127,18 @@ def regular_at(parent_fd: int, name: str) -> int:
             (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
         os.close(fd)
         raise UnsafePath("regular file identity changed while opening")
+    return fd
+
+
+def private_regular_at(parent_fd: int, name: str) -> int:
+    """Pin an operator-owned, private, singly-linked regular child."""
+    fd = regular_at(parent_fd, name)
+    info = os.fstat(fd)
+    if (info.st_uid != os.geteuid() or info.st_mode & 0o077
+            or info.st_nlink != 1):
+        os.close(fd)
+        raise UnsafePath(
+            "regular file must be operator-owned, private, and singly linked")
     return fd
 
 
