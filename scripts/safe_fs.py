@@ -118,3 +118,22 @@ def regular_at(parent_fd: int, name: str) -> int:
         os.close(fd)
         raise UnsafePath("only regular file inputs are supported")
     return fd
+
+
+@contextmanager
+def trusted_regular(path: str | Path):
+    """Pin a regular file whose owner, mode and ancestors exclude lower trust."""
+    p = absolute(path)
+    if p.name in ("", ".", ".."):
+        raise UnsafePath("invalid regular file path")
+    with directory(p.parent) as parent_fd:
+        fd = regular_at(parent_fd, p.name)
+        try:
+            info = os.fstat(fd)
+            if info.st_uid not in (0, os.geteuid()):
+                raise UnsafePath("regular file belongs to another user")
+            if info.st_mode & 0o022:
+                raise UnsafePath("regular file is group/other writable")
+            yield fd
+        finally:
+            os.close(fd)

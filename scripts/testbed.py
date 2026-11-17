@@ -29,6 +29,10 @@ SNAPSHOT_TOKEN = "I_AUTHORIZE_OFFLINE_SNAPSHOT"
 NAME = re.compile(r"rhel-lab-[a-z0-9][a-z0-9-]{0,30}\Z")
 LABEL = re.compile(r"[a-z][a-z0-9-]{0,39}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+MEDIA_SCHEMA = "qsol-rhel-staged-media/v1"
+STAGED_ISO = "installer.iso"
+MEDIA_RECEIPT = "installer.iso.receipt.json"
 
 
 class TestbedError(ValueError):
@@ -90,8 +94,10 @@ def state_dir(text: str, *, must_exist: bool = False) -> Path:
 
 def iso_file(text: str) -> Path:
     path = absolute_path(text)
-    if path.suffix.lower() != ".iso" or not path.is_file():
+    if path.suffix.lower() != ".iso":
         raise TestbedError("ISO must be an existing regular .iso file")
+    with safe_fs.trusted_regular(path):
+        pass
     return path
 
 
@@ -99,8 +105,13 @@ def paths(root: Path) -> tuple[Path, Path]:
     return root / "disk.qcow2", root / "domain.xml"
 
 
-def render_xml(cfg: dict, root: Path, iso: Path) -> str:
+def staged_iso(root: Path) -> Path:
+    return root / STAGED_ISO
+
+
+def render_xml(cfg: dict, root: Path) -> str:
     disk, _ = paths(root)
+    iso = staged_iso(root)
     domain = ET.Element("domain", {"type": "kvm"})
     ET.SubElement(domain, "name").text = cfg["name"]
     ET.SubElement(domain, "memory", {"unit": "MiB"}).text = str(cfg["memory_mib"])
@@ -126,11 +137,11 @@ def render_xml(cfg: dict, root: Path, iso: Path) -> str:
     ET.SubElement(console, "target", {"type": "serial", "port": "0"})
     ET.indent(domain)
     xml = ET.tostring(domain, encoding="unicode") + "\n"
-    audit_xml(xml, cfg, root, iso)
+    audit_xml(xml, cfg, root)
     return xml
 
 
-def audit_xml(xml: str, cfg: dict, root: Path, iso: Path) -> None:
+def audit_xml(xml: str, cfg: dict, root: Path) -> None:
     """Reject interfaces, passthrough, external listeners and unexpected disk paths."""
     domain = ET.fromstring(xml)
     if domain.tag != "domain" or domain.get("type") != "kvm":
@@ -188,7 +199,7 @@ def audit_xml(xml: str, cfg: dict, root: Path, iso: Path) -> None:
     if any(b.get("dev") not in {"cdrom", "hd"} for b in domain.findall(".//boot")):
         raise TestbedError("non-disk or network boot is forbidden")
     expected = {"disk": (str(root / "disk.qcow2"), "qcow2"),
-                "cdrom": (str(iso), "raw")}
+                "cdrom": (str(staged_iso(root)), "raw")}
     actual_disks = devices.findall("disk")
     if len(actual_disks) != 2:
         raise TestbedError("expected exactly disk and ISO")
@@ -247,26 +258,181 @@ def approve(value: str | None, expected: str) -> None:
         raise TestbedError(f"explicit --approve {expected} required")
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written == 0:
+            raise TestbedError("short write while staging installer ISO")
+        view = view[written:]
+
+
+def _copy_iso(source_fd: int, staged_fd: int) -> tuple[str, int]:
+    before = os.fstat(source_fd)
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    count = 0
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            break
+        _write_all(staged_fd, chunk)
+        digest.update(chunk)
+        count += len(chunk)
+    os.fsync(staged_fd)
+    after = os.fstat(source_fd)
+    before_identity = (before.st_dev, before.st_ino, before.st_size,
+                       before.st_mtime_ns, before.st_ctime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns)
+    if before_identity != after_identity or count != after.st_size:
+        raise TestbedError("installer ISO changed during private staging")
+    if os.fstat(staged_fd).st_size != count:
+        raise TestbedError("staged installer ISO size differs from source")
+    return digest.hexdigest(), count
+
+
+def _write_json_at(parent_fd: int, name: str, document: dict) -> None:
+    fd = os.open(name, safe_fs.FILE_WRITE_FLAGS, 0o600, dir_fd=parent_fd)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(document, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _stage_iso(root: Path, lab_fd: int, source: Path) -> dict:
+    staged_fd = -1
+    try:
+        with safe_fs.trusted_regular(source) as source_fd:
+            staged_fd = os.open(STAGED_ISO, safe_fs.FILE_RDWR_CREATE_FLAGS,
+                                0o600, dir_fd=lab_fd)
+            os.fchmod(staged_fd, 0o600)
+            digest, size = _copy_iso(source_fd, staged_fd)
+            staged_info = os.fstat(staged_fd)
+    except Exception:
+        if staged_fd >= 0:
+            os.close(staged_fd)
+            if safe_fs.exists_at(lab_fd, STAGED_ISO):
+                os.unlink(STAGED_ISO, dir_fd=lab_fd)
+        raise
+    else:
+        os.close(staged_fd)
+
+    report = {
+        "schema": MEDIA_SCHEMA,
+        "source": str(source),
+        "path": str(staged_iso(root)),
+        "sha256": digest,
+        "bytes": size,
+        "device": staged_info.st_dev,
+        "inode": staged_info.st_ino,
+    }
+    try:
+        _write_json_at(lab_fd, MEDIA_RECEIPT, report)
+        os.fsync(lab_fd)
+    except Exception:
+        if safe_fs.exists_at(lab_fd, MEDIA_RECEIPT):
+            os.unlink(MEDIA_RECEIPT, dir_fd=lab_fd)
+        os.unlink(STAGED_ISO, dir_fd=lab_fd)
+        raise
+    return report
+
+
+def _read_media_receipt(fd: int, root: Path) -> dict:
+    info = os.fstat(fd)
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise TestbedError("staged media receipt must be operator-owned and private")
+    if info.st_size > 16 * 1024:
+        raise TestbedError("staged media receipt is unexpectedly large")
+    os.lseek(fd, 0, os.SEEK_SET)
+    raw = b""
+    while len(raw) <= 16 * 1024:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        raw += chunk
+    document = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs)
+    fields = {"schema", "source", "path", "sha256", "bytes", "device", "inode"}
+    if not isinstance(document, dict) or set(document) != fields:
+        raise TestbedError("unsupported staged media receipt schema/fields")
+    if (document["schema"] != MEDIA_SCHEMA
+            or not isinstance(document["source"], str)
+            or document["path"] != str(staged_iso(root))
+            or not isinstance(document["sha256"], str)
+            or SHA256.fullmatch(document["sha256"]) is None
+            or type(document["bytes"]) is not int or document["bytes"] < 0
+            or type(document["device"]) is not int
+            or type(document["inode"]) is not int):
+        raise TestbedError("invalid staged media receipt")
+    return document
+
+
+def _hash_stable_fd(fd: int, label: str) -> tuple[str, int]:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise TestbedError(f"{label} is not a regular file")
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    count = 0
+    for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
+        digest.update(chunk)
+        count += len(chunk)
+    after = os.fstat(fd)
+    if ((before.st_dev, before.st_ino, before.st_size,
+         before.st_mtime_ns, before.st_ctime_ns)
+        != (after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns) or count != after.st_size):
+        raise TestbedError(f"{label} changed during hashing")
+    return digest.hexdigest(), count
+
+
+def verify_staged_iso(root: Path) -> dict:
+    """Reopen and verify the private media object immediately before VM use."""
+    with safe_fs.lab_directory(root) as lab_fd:
+        receipt_fd = safe_fs.regular_at(lab_fd, MEDIA_RECEIPT)
+        try:
+            receipt = _read_media_receipt(receipt_fd, root)
+        finally:
+            os.close(receipt_fd)
+        iso_fd = safe_fs.regular_at(lab_fd, STAGED_ISO)
+        try:
+            info = os.fstat(iso_fd)
+            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise TestbedError("staged installer ISO must be operator-owned and private")
+            if (info.st_dev, info.st_ino) != (receipt["device"], receipt["inode"]):
+                raise TestbedError("staged installer ISO identity differs from receipt")
+            digest, size = _hash_stable_fd(iso_fd, "staged installer ISO")
+        finally:
+            os.close(iso_fd)
+    if digest != receipt["sha256"] or size != receipt["bytes"]:
+        raise TestbedError("staged installer ISO digest or size differs from receipt")
+    return receipt
+
+
 def plan(cfg: dict, root: Path, iso: Path) -> dict:
     disk, definition = paths(root)
     return {
         "status": "PLANNED_NOT_EXECUTED", "connection": URI, "network": "none",
         "disk": str(disk), "definition": str(definition), "iso": str(iso),
-        "size_gib": cfg["disk_gib"], "xml": render_xml(cfg, root, iso),
+        "staged_iso": str(staged_iso(root)),
+        "size_gib": cfg["disk_gib"], "xml": render_xml(cfg, root),
     }
 
 
 def prepare(cfg: dict, root: Path, iso: Path, token: str | None) -> dict:
     approve(token, PREPARE_TOKEN)
     need("qemu-img")
+    iso = iso_file(str(iso))
     disk, definition = paths(root)
-    xml = render_xml(cfg, root, iso)
+    xml = render_xml(cfg, root)
     # Keep an operator-owned, private lab FD open across all host mutations.
     # qemu-img receives an inherited FD, never a mutable ancestor pathname.
     with safe_fs.lab_directory(root, create=True) as lab_fd:
-        if any(safe_fs.exists_at(lab_fd, name)
-               for name in ("disk.qcow2", "domain.xml")):
-            raise TestbedError("refusing to replace existing disk/XML")
+        if any(safe_fs.exists_at(lab_fd, name) for name in
+               ("disk.qcow2", "domain.xml", STAGED_ISO, MEDIA_RECEIPT)):
+            raise TestbedError("refusing to replace existing lab state")
+        media = _stage_iso(root, lab_fd, iso)
         disk_fd = os.open("disk.qcow2",
                           safe_fs.FILE_RDWR_CREATE_FLAGS,
                           0o600, dir_fd=lab_fd)
@@ -282,42 +448,38 @@ def prepare(cfg: dict, root: Path, iso: Path, token: str | None) -> dict:
             stream.write(xml)
             stream.flush()
             os.fsync(stream.fileno())
+        os.fsync(lab_fd)
     return {"status": "PREPARED_NOT_DEFINED_OR_BOOTED",
             "definition": str(definition), "disk": str(disk),
-            "manual_next": f"virsh -c {URI} define {definition}"}
+            "iso": media["path"], "iso_sha256": media["sha256"],
+            "manual_next": ("run scripts/testbed.py verify-media --lab-root "
+                            f"{root} immediately before manual libvirt use")}
 
 
-def audit_defined(cfg: dict, root: Path, iso: Path) -> dict:
+def verify_media(root: Path) -> dict:
+    media = verify_staged_iso(root)
+    return {"status": "STAGED_ISO_VERIFIED", "iso": media["path"],
+            "iso_sha256": media["sha256"], "bytes": media["bytes"],
+            "manual_next": f"virsh -c {URI} define {root / 'domain.xml'}"}
+
+
+def audit_defined(cfg: dict, root: Path) -> dict:
     need("virsh")
+    verify_staged_iso(root)
     # Verify stored XML AND current (possibly live/hotplugged) XML.
     for options in (["--inactive"], []):
         xml = local_command(["virsh", "-c", URI, "dumpxml", *options, cfg["name"]])
-        audit_xml(xml, cfg, root, iso)
+        audit_xml(xml, cfg, root)
     return {"status": "DOMAIN_XML_AUDITED", "domain": cfg["name"],
             "limitation": "Does not prove host egress isolation or prevent races."}
 
 
 def hash_fd(fd: int) -> tuple[str, int]:
     """Hash a stable, already opened regular descriptor."""
-    before = os.fstat(fd)
-    if not stat.S_ISREG(before.st_mode):
-        raise TestbedError("snapshot output is not a regular file")
-    os.lseek(fd, 0, os.SEEK_SET)
-    digest = hashlib.sha256()
-    count = 0
-    for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
-        digest.update(chunk)
-        count += len(chunk)
-    after = os.fstat(fd)
-    if ((before.st_dev, before.st_ino, before.st_size,
-         before.st_mtime_ns, before.st_ctime_ns)
-        != (after.st_dev, after.st_ino, after.st_size,
-            after.st_mtime_ns, after.st_ctime_ns) or count != after.st_size):
-        raise TestbedError("snapshot image changed during hashing")
-    return digest.hexdigest(), count
+    return _hash_stable_fd(fd, "snapshot output")
 
 
-def snapshot(cfg: dict, root: Path, iso: Path, label: str, sha: str,
+def snapshot(cfg: dict, root: Path, label: str, sha: str,
              token: str | None) -> dict:
     approve(token, SNAPSHOT_TOKEN)
     if LABEL.fullmatch(label) is None or SHA.fullmatch(sha) is None:
@@ -326,7 +488,7 @@ def snapshot(cfg: dict, root: Path, iso: Path, label: str, sha: str,
     with safe_fs.lab_directory(root) as lab_fd:
         source_fd = safe_fs.regular_at(lab_fd, "disk.qcow2")
         try:
-            audit_defined(cfg, root, iso)
+            audit_defined(cfg, root)
             state = local_command(["virsh", "-c", URI, "domstate", cfg["name"]])
             if state != "shut off":
                 raise TestbedError(f"domain is not shut off: {state}")
@@ -392,11 +554,12 @@ def snapshot(cfg: dict, root: Path, iso: Path, label: str, sha: str,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="action", required=True)
-    for name in ("plan", "prepare", "audit-defined", "snapshot"):
+    for name in ("plan", "prepare", "verify-media", "audit-defined", "snapshot"):
         p = subs.add_parser(name)
         p.add_argument("--config", type=Path, default=REPO / "lab/testbed.json")
         p.add_argument("--lab-root", required=True)
-        p.add_argument("--iso", required=True)
+        if name in {"plan", "prepare"}:
+            p.add_argument("--iso", required=True)
         if name in {"prepare", "snapshot"}:
             p.add_argument("--approve")
         if name == "snapshot":
@@ -405,16 +568,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         cfg = read_config(args.config)
-        root = state_dir(args.lab_root, must_exist=args.action in {"audit-defined", "snapshot"})
-        iso = iso_file(args.iso)
+        root = state_dir(args.lab_root,
+                         must_exist=args.action in {"verify-media", "audit-defined", "snapshot"})
         if args.action == "plan":
+            iso = iso_file(args.iso)
             report = plan(cfg, root, iso)
         elif args.action == "prepare":
+            iso = iso_file(args.iso)
             report = prepare(cfg, root, iso, args.approve)
+        elif args.action == "verify-media":
+            report = verify_media(root)
         elif args.action == "audit-defined":
-            report = audit_defined(cfg, root, iso)
+            report = audit_defined(cfg, root)
         else:
-            report = snapshot(cfg, root, iso, args.label, args.source_sha, args.approve)
+            report = snapshot(cfg, root, args.label, args.source_sha, args.approve)
     except (TestbedError, safe_fs.UnsafePath, OSError, ValueError, subprocess.SubprocessError, ET.ParseError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1

@@ -1,6 +1,7 @@
 """Safe, mocked testbed tests. No virsh, qemu-img, KVM, root or network use."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +22,7 @@ class TestbedTests(unittest.TestCase):
         self.root = self.base / "vm-state"
         self.iso = self.base / "rhel.iso"
         self.iso.write_bytes(b"fixture, not installation media")
+        self.iso.chmod(0o600)
         self.cfg = {
             "schema": t.SCHEMA, "name": "rhel-lab-offline-01",
             "architecture": "x86_64", "network": "none",
@@ -59,60 +61,67 @@ class TestbedTests(unittest.TestCase):
             t.read_config(self.config_path)
 
     def test_xml_is_serial_only(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         self.assertIn("rhel-lab-offline-01", xml)
         self.assertNotIn("<interface", xml)
         self.assertNotIn("<graphics", xml)
-        t.audit_xml(xml, self.cfg, self.root, self.iso)
+        self.assertIn(str(t.staged_iso(self.root)), xml)
+        t.audit_xml(xml, self.cfg, self.root)
 
     def test_interface_injection_rejected(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         xml = xml.replace("</devices>", "<interface type='network' /></devices>")
         with self.assertRaises(t.TestbedError):
-            t.audit_xml(xml, self.cfg, self.root, self.iso)
+            t.audit_xml(xml, self.cfg, self.root)
 
     def test_tcp_serial_listener_rejected(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         xml = xml.replace('<serial type="pty">', '<serial type="tcp">')
         with self.assertRaises(t.TestbedError):
-            t.audit_xml(xml, self.cfg, self.root, self.iso)
+            t.audit_xml(xml, self.cfg, self.root)
 
     def test_input_passthrough_rejected(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         xml = xml.replace("</devices>", '<input type="passthrough" bus="virtio" /></devices>')
         with self.assertRaises(t.TestbedError):
-            t.audit_xml(xml, self.cfg, self.root, self.iso)
+            t.audit_xml(xml, self.cfg, self.root)
 
     def test_unapproved_emulator_rejected(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         xml = xml.replace("</devices>", "<emulator>/tmp/untrusted-qemu</emulator></devices>")
         with self.assertRaises(t.TestbedError):
-            t.audit_xml(xml, self.cfg, self.root, self.iso)
+            t.audit_xml(xml, self.cfg, self.root)
 
     def test_changed_resource_limits_rejected(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         xml = xml.replace("<vcpu>2</vcpu>", "<vcpu>32</vcpu>")
         with self.assertRaises(t.TestbedError):
-            t.audit_xml(xml, self.cfg, self.root, self.iso)
+            t.audit_xml(xml, self.cfg, self.root)
 
     def test_libvirt_kib_memory_normalization_allowed(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         xml = xml.replace('<memory unit="MiB">4096</memory>',
                           '<memory unit="KiB">4194304</memory>')
-        t.audit_xml(xml, self.cfg, self.root, self.iso)
+        t.audit_xml(xml, self.cfg, self.root)
 
     def test_file_path_substitution_rejected(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         xml = xml.replace(str(self.root / "disk.qcow2"), "/tmp/other.qcow2")
         with self.assertRaises(t.TestbedError):
-            t.audit_xml(xml, self.cfg, self.root, self.iso)
+            t.audit_xml(xml, self.cfg, self.root)
+
+    def test_iso_path_substitution_rejected(self):
+        xml = t.render_xml(self.cfg, self.root)
+        xml = xml.replace(str(t.staged_iso(self.root)), str(self.iso))
+        with self.assertRaises(t.TestbedError):
+            t.audit_xml(xml, self.cfg, self.root)
 
     def test_qemu_extension_rejected(self):
-        xml = t.render_xml(self.cfg, self.root, self.iso)
+        xml = t.render_xml(self.cfg, self.root)
         xml = xml.replace("</domain>",
               '<commandline xmlns="http://libvirt.org/schemas/domain/qemu" /></domain>')
         with self.assertRaises(t.TestbedError):
-            t.audit_xml(xml, self.cfg, self.root, self.iso)
+            t.audit_xml(xml, self.cfg, self.root)
 
     def test_symlink_state_root_rejected(self):
         self.root.mkdir()
@@ -124,6 +133,20 @@ class TestbedTests(unittest.TestCase):
     def test_state_inside_repo_rejected(self):
         with self.assertRaises(t.TestbedError):
             t.state_dir(str(t.REPO / "local"))
+
+    def test_group_writable_iso_is_rejected(self):
+        self.iso.chmod(0o660)
+        with self.assertRaises(safe_fs.UnsafePath):
+            t.iso_file(str(self.iso))
+
+    def test_iso_under_writable_ancestor_is_rejected(self):
+        shared = self.base / "shared-media"
+        shared.mkdir(mode=0o700)
+        media = shared / "rhel.iso"
+        media.write_bytes(b"untrusted fixture")
+        shared.chmod(0o777)
+        with self.assertRaises(safe_fs.UnsafePath):
+            t.iso_file(str(media))
 
     def test_plan_is_pure(self):
         with patch.object(t, "local_command", side_effect=AssertionError("execution forbidden")):
@@ -167,12 +190,69 @@ class TestbedTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "PREPARED_NOT_DEFINED_OR_BOOTED")
         self.assertTrue((self.root / "domain.xml").is_file())
         self.assertEqual(os.stat(self.root).st_mode & 0o077, 0)
+        staged = t.staged_iso(self.root)
+        self.assertEqual(staged.read_bytes(), self.iso.read_bytes())
+        self.assertEqual(os.stat(staged).st_mode & 0o777, 0o600)
+        definition = (self.root / "domain.xml").read_text(encoding="utf-8")
+        self.assertIn(str(staged), definition)
+        self.assertNotIn(str(self.iso), definition)
+        media_receipt = json.loads(
+            (self.root / t.MEDIA_RECEIPT).read_text(encoding="utf-8"))
+        expected_digest = hashlib.sha256(self.iso.read_bytes()).hexdigest()
+        self.assertEqual(media_receipt["sha256"], expected_digest)
+        self.assertEqual(t.verify_media(self.root)["iso_sha256"], expected_digest)
+        self.assertIn("verify-media", receipt["manual_next"])
         with self.assertRaises(t.TestbedError):
             t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
 
+    def test_source_replacement_does_not_change_staged_media(self):
+        original = self.iso.read_bytes()
+
+        def fake_qemu(args, timeout=30, pass_fds=()):
+            self.iso.unlink()
+            self.iso.write_bytes(b"replacement media")
+            Path(args[4]).write_bytes(b"simulated image")
+            return ""
+
+        with patch.object(t, "need"), patch.object(t, "local_command",
+                                                  side_effect=fake_qemu):
+            t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
+        self.assertEqual(t.staged_iso(self.root).read_bytes(), original)
+        definition = (self.root / "domain.xml").read_text(encoding="utf-8")
+        self.assertIn(str(t.staged_iso(self.root)), definition)
+        self.assertNotIn(str(self.iso), definition)
+
+    def test_changed_staged_media_is_rejected(self):
+        def fake_qemu(args, timeout=30, pass_fds=()):
+            Path(args[4]).write_bytes(b"simulated image")
+            return ""
+
+        with patch.object(t, "need"), patch.object(t, "local_command",
+                                                  side_effect=fake_qemu):
+            t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
+        t.staged_iso(self.root).write_bytes(b"changed")
+        with self.assertRaises(t.TestbedError):
+            t.verify_media(self.root)
+
+    def test_replaced_staged_inode_is_rejected(self):
+        def fake_qemu(args, timeout=30, pass_fds=()):
+            Path(args[4]).write_bytes(b"simulated image")
+            return ""
+
+        with patch.object(t, "need"), patch.object(t, "local_command",
+                                                  side_effect=fake_qemu):
+            t.prepare(self.cfg, self.root, self.iso, t.PREPARE_TOKEN)
+        staged = t.staged_iso(self.root)
+        contents = staged.read_bytes()
+        staged.rename(self.root / "original-installer.iso")
+        staged.write_bytes(contents)
+        staged.chmod(0o600)
+        with self.assertRaises(t.TestbedError):
+            t.verify_media(self.root)
+
     def test_snapshot_requires_approval(self):
         with self.assertRaises(t.TestbedError):
-            t.snapshot(self.cfg, self.root, self.iso, "baseline", "a" * 40, None)
+            t.snapshot(self.cfg, self.root, "baseline", "a" * 40, None)
 
     def test_snapshot_refuses_live_vm(self):
         self.root.mkdir(mode=0o700)
@@ -180,24 +260,24 @@ class TestbedTests(unittest.TestCase):
         with patch.object(t, "need"), patch.object(t, "audit_defined"), \
              patch.object(t, "local_command", return_value="running"):
             with self.assertRaises(t.TestbedError):
-                t.snapshot(self.cfg, self.root, self.iso, "baseline", "a" * 40,
+                t.snapshot(self.cfg, self.root, "baseline", "a" * 40,
                            t.SNAPSHOT_TOKEN)
         self.assertFalse((self.root / "snapshots").exists())
 
     def test_snapshot_rejects_bad_sha(self):
         with self.assertRaises(t.TestbedError):
-            t.snapshot(self.cfg, self.root, self.iso, "baseline", "not-a-sha",
+            t.snapshot(self.cfg, self.root, "baseline", "not-a-sha",
                        t.SNAPSHOT_TOKEN)
 
     def test_audit_checks_both_live_and_persistent(self):
-        safe = t.render_xml(self.cfg, self.root, self.iso)
+        safe = t.render_xml(self.cfg, self.root)
         calls = []
         def fake_command(args, timeout=30):
             calls.append(args)
             return safe
-        with patch.object(t, "need"), patch.object(t, "local_command",
-                                                side_effect=fake_command):
-            t.audit_defined(self.cfg, self.root, self.iso)
+        with patch.object(t, "need"), patch.object(t, "verify_staged_iso"), \
+             patch.object(t, "local_command", side_effect=fake_command):
+            t.audit_defined(self.cfg, self.root)
         self.assertEqual(len(calls), 2)
         self.assertIn("--inactive", calls[0])
         self.assertNotIn("--inactive", calls[1])
@@ -238,7 +318,7 @@ class TestbedTests(unittest.TestCase):
         (self.root / "disk.qcow2").symlink_to(outside)
         with patch.object(t, "need"):
             with self.assertRaises(OSError):
-                t.snapshot(self.cfg, self.root, self.iso, "baseline", "a" * 40,
+                t.snapshot(self.cfg, self.root, "baseline", "a" * 40,
                            t.SNAPSHOT_TOKEN)
 
     def test_offline_snapshot_receipt_is_private(self):
@@ -259,7 +339,7 @@ class TestbedTests(unittest.TestCase):
 
         with patch.object(t, "need"), patch.object(t, "audit_defined"), \
              patch.object(t, "local_command", side_effect=fake_command):
-            result = t.snapshot(self.cfg, self.root, self.iso, "baseline",
+            result = t.snapshot(self.cfg, self.root, "baseline",
                                 "a" * 40, t.SNAPSHOT_TOKEN)
         receipt = Path(result["receipt"])
         image = Path(result["image"])
