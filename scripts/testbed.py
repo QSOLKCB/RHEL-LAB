@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 #!/usr/bin/env python3
 """Local-only KVM/libvirt testbed. No guest boot, network, or sudo commands."""
 from __future__ import annotations
