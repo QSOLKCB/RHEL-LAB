@@ -87,8 +87,8 @@ def _inventory_fd(root_fd: int) -> dict:
 
 
 def inventory(input_dir: Path) -> dict:
-    """Fail closed on symlink, special file, unreadable subtree, observed race."""
-    with safe_fs.directory(input_dir) as root_fd:
+    """Inventory a pinned private root, failing closed on unsafe contents."""
+    with safe_fs.directory(input_dir, private=True) as root_fd:
         return _inventory_fd(root_fd)
 
 
@@ -100,9 +100,9 @@ def _manifest_location(manifest: Path) -> tuple[Path, str]:
 
 
 def seal(input_dir: Path, output: Path) -> dict:
-    """Write manifest with mode 0600 relative to a pinned private directory."""
+    """Seal private evidence to a 0600 manifest in a private directory."""
     parent, name = _manifest_location(output)
-    with safe_fs.directory(input_dir) as root_fd:
+    with safe_fs.directory(input_dir, private=True) as root_fd:
         st = os.fstat(root_fd)
         root_identity = (st.st_dev, st.st_ino)
         with safe_fs.directory(parent, private=True, forbidden=root_identity) as dest_fd:
@@ -117,9 +117,9 @@ def seal(input_dir: Path, output: Path) -> dict:
 
 
 def verify(input_dir: Path, manifest: Path) -> dict:
-    """Verify manifest and evidence via pinned FDs, refusing observed changes."""
+    """Verify private evidence and manifest via pinned file descriptors."""
     parent, name = _manifest_location(manifest)
-    with safe_fs.directory(input_dir) as root_fd:
+    with safe_fs.directory(input_dir, private=True) as root_fd:
         st = os.fstat(root_fd)
         with safe_fs.directory(parent, private=True,
                                forbidden=(st.st_dev, st.st_ino)) as manifest_fd:
