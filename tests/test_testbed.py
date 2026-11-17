@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 """Safe, mocked testbed tests. No virsh, qemu-img, KVM, root or network use."""
 from __future__ import annotations
 
