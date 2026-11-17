@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 # RHEL-LAB-002 — The Virtual Testbed
 
 This milestone supplies an offline-first *host-side implementation*, not a preinstalled RHEL guest. No VM, kernel experiment, Red Hat service or Daybreak scan is executed in GitHub Actions. The testbed runs only on an operator-owned Linux host, after explicit approval.
