@@ -113,10 +113,17 @@ def exists_at(fd: int, name: str) -> bool:
 
 
 def regular_at(parent_fd: int, name: str) -> int:
-    fd = os.open(name, FILE_READ_FLAGS, dir_fd=parent_fd)
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-        os.close(fd)
+    # Reject FIFOs and special files before opening them; O_NONBLOCK and
+    # O_NOFOLLOW remain mandatory against a subsequent pathname swap.
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
         raise UnsafePath("only regular file inputs are supported")
+    fd = os.open(name, FILE_READ_FLAGS, dir_fd=parent_fd)
+    after = os.fstat(fd)
+    if (not stat.S_ISREG(after.st_mode) or
+            (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
+        os.close(fd)
+        raise UnsafePath("regular file identity changed while opening")
     return fd
 
 
