@@ -9,7 +9,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.evidence import EvidenceError, inventory, seal, verify
+from scripts.evidence import (
+    EvidenceError,
+    MAX_MANIFEST_BYTES,
+    MAX_MANIFEST_NESTING,
+    inventory,
+    seal,
+    verify,
+)
 from scripts.safe_fs import UnsafePath
 
 
@@ -75,6 +82,42 @@ class EvidenceTests(unittest.TestCase):
         document["files"][0]["sha256"] = "0" * 64
         self.manifest.write_text(json.dumps(document))
         with self.assertRaises(EvidenceError):
+            verify(self.data, self.manifest)
+
+    def test_oversized_manifest_is_rejected_before_json_decode(self) -> None:
+        self.manifest.touch()
+        self.manifest.truncate(MAX_MANIFEST_BYTES + 1)
+        with patch("scripts.evidence.json.loads") as loads:
+            with self.assertRaisesRegex(EvidenceError, "byte size limit"):
+                verify(self.data, self.manifest)
+        loads.assert_not_called()
+
+    def test_excessive_manifest_nesting_is_rejected_before_decode(self) -> None:
+        levels = MAX_MANIFEST_NESTING + 1
+        self.manifest.write_text("[" * levels + "]" * levels)
+        with patch("scripts.evidence.json.loads") as loads:
+            with self.assertRaisesRegex(EvidenceError, "nesting exceeds"):
+                verify(self.data, self.manifest)
+        loads.assert_not_called()
+
+    def test_manifest_file_count_is_bounded(self) -> None:
+        seal(self.data, self.manifest)
+        with patch("scripts.evidence.MAX_MANIFEST_FILES", 1):
+            with self.assertRaisesRegex(EvidenceError, "file records"):
+                verify(self.data, self.manifest)
+
+    def test_manifest_path_length_is_bounded(self) -> None:
+        seal(self.data, self.manifest)
+        with patch("scripts.evidence.MAX_MANIFEST_PATH_CHARS", 4):
+            with self.assertRaisesRegex(EvidenceError, "invalid path"):
+                verify(self.data, self.manifest)
+
+    def test_manifest_schema_is_exact(self) -> None:
+        seal(self.data, self.manifest)
+        document = json.loads(self.manifest.read_text())
+        document["extra"] = "not permitted"
+        self.manifest.write_text(json.dumps(document))
+        with self.assertRaisesRegex(EvidenceError, "top-level schema"):
             verify(self.data, self.manifest)
 
     def test_nested_paths(self) -> None:

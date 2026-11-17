@@ -20,6 +20,18 @@ except ImportError:  # direct invocation: python scripts/evidence.py
     import safe_fs
 
 SCHEMA = "qsol-rhel-evidence/v1"
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_MANIFEST_FILES = 10_000
+MAX_MANIFEST_NESTING = 8
+MAX_MANIFEST_PATH_CHARS = 4096
+
+_MANIFEST_KEYS = frozenset(("schema", "algorithm", "files"))
+_FILE_KEYS = frozenset(("path", "bytes", "sha256"))
+_LOWER_HEX = frozenset("0123456789abcdef")
+_MAX_JSON_SEPARATORS = MAX_MANIFEST_FILES * 3 + 2
+_MAX_JSON_STRING_UNITS = MAX_MANIFEST_PATH_CHARS * 2
+_MAX_JSON_SCALAR_CHARS = 128
+_READ_CHUNK_BYTES = 64 * 1024
 
 
 class EvidenceError(ValueError):
@@ -99,6 +111,138 @@ def _manifest_location(manifest: Path) -> tuple[Path, str]:
     return value.parent, value.name
 
 
+def _validate_manifest(document: object) -> dict:
+    """Require the exact bounded schema emitted by this module."""
+    if not isinstance(document, dict) or set(document) != _MANIFEST_KEYS:
+        raise EvidenceError("manifest has an invalid top-level schema")
+    if document["schema"] != SCHEMA or document["algorithm"] != "sha256":
+        raise EvidenceError("manifest schema or algorithm is unsupported")
+    files = document["files"]
+    if not isinstance(files, list):
+        raise EvidenceError("manifest files must be a list")
+    if len(files) > MAX_MANIFEST_FILES:
+        raise EvidenceError(f"manifest exceeds {MAX_MANIFEST_FILES} file records")
+    for index, record in enumerate(files):
+        if not isinstance(record, dict) or set(record) != _FILE_KEYS:
+            raise EvidenceError(f"manifest file record {index} has an invalid schema")
+        path = record["path"]
+        size = record["bytes"]
+        digest = record["sha256"]
+        if not isinstance(path, str) or not path or len(path) > MAX_MANIFEST_PATH_CHARS:
+            raise EvidenceError(f"manifest file record {index} has an invalid path")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise EvidenceError(f"manifest file record {index} has an invalid byte count")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(char not in _LOWER_HEX for char in digest)):
+            raise EvidenceError(f"manifest file record {index} has an invalid SHA-256 digest")
+    return document
+
+
+def _preflight_json(document: str) -> None:
+    """Bound JSON parser work before deserializing untrusted text."""
+    depth = 0
+    separators = 0
+    scalar_chars = 0
+    index = 0
+    while index < len(document):
+        char = document[index]
+        if char == '"':
+            scalar_chars = 0
+            string_units = 0
+            index += 1
+            while index < len(document):
+                char = document[index]
+                if char == '"':
+                    break
+                if char == "\\":
+                    index += 1
+                    if index >= len(document):
+                        break
+                    if document[index] == "u":
+                        index += 4
+                string_units += 1
+                if string_units > _MAX_JSON_STRING_UNITS:
+                    raise EvidenceError("manifest JSON string exceeds safety limit")
+                index += 1
+        elif char in "[{":
+            scalar_chars = 0
+            depth += 1
+            if depth > MAX_MANIFEST_NESTING:
+                raise EvidenceError(
+                    f"manifest JSON nesting exceeds {MAX_MANIFEST_NESTING} levels")
+        elif char in "]}":
+            scalar_chars = 0
+            if depth:
+                depth -= 1
+        elif char == ",":
+            scalar_chars = 0
+            separators += 1
+            if separators > _MAX_JSON_SEPARATORS:
+                raise EvidenceError("manifest JSON contains too many values")
+        elif char == ":" or char.isspace():
+            scalar_chars = 0
+        else:
+            scalar_chars += 1
+            if scalar_chars > _MAX_JSON_SCALAR_CHARS:
+                raise EvidenceError("manifest JSON scalar exceeds safety limit")
+        index += 1
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise EvidenceError(f"manifest contains duplicate key: {key!a}")
+        result[key] = value
+    return result
+
+
+def _read_manifest(fd: int, first: os.stat_result) -> dict:
+    if first.st_size > MAX_MANIFEST_BYTES:
+        raise EvidenceError(
+            f"manifest exceeds {MAX_MANIFEST_BYTES}-byte size limit")
+    chunks = []
+    count = 0
+    while count <= MAX_MANIFEST_BYTES:
+        chunk = os.read(
+            fd, min(_READ_CHUNK_BYTES, MAX_MANIFEST_BYTES + 1 - count))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        count += len(chunk)
+    if count > MAX_MANIFEST_BYTES:
+        raise EvidenceError(
+            f"manifest exceeds {MAX_MANIFEST_BYTES}-byte size limit")
+    if count != first.st_size or not _unchanged(first, os.fstat(fd)):
+        raise EvidenceError("manifest changed while reading")
+    try:
+        text = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise EvidenceError("manifest is not valid UTF-8") from exc
+    _preflight_json(text)
+    try:
+        document = json.loads(text, object_pairs_hook=_unique_object)
+    except EvidenceError:
+        raise
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise EvidenceError("manifest is not valid bounded JSON") from exc
+    return _validate_manifest(document)
+
+
+def _serialize_manifest(report: dict) -> str:
+    _validate_manifest(report)
+    chunks = []
+    byte_count = 1  # Final newline.
+    encoder = json.JSONEncoder(indent=2, sort_keys=True)
+    for chunk in encoder.iterencode(report):
+        byte_count += len(chunk.encode("utf-8"))
+        if byte_count > MAX_MANIFEST_BYTES:
+            raise EvidenceError(
+                f"manifest exceeds {MAX_MANIFEST_BYTES}-byte size limit")
+        chunks.append(chunk)
+    return "".join(chunks) + "\n"
+
+
 def seal(input_dir: Path, output: Path) -> dict:
     """Seal private evidence to a 0600 manifest in a private directory."""
     parent, name = _manifest_location(output)
@@ -107,10 +251,10 @@ def seal(input_dir: Path, output: Path) -> dict:
         root_identity = (st.st_dev, st.st_ino)
         with safe_fs.directory(parent, private=True, forbidden=root_identity) as dest_fd:
             report = _inventory_fd(root_fd)
+            document = _serialize_manifest(report)
             fd = os.open(name, safe_fs.FILE_WRITE_FLAGS, 0o600, dir_fd=dest_fd)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-                json.dump(report, stream, indent=2, sort_keys=True)
-                stream.write("\n")
+                stream.write(document)
                 stream.flush()
                 os.fsync(stream.fileno())
             return report
@@ -128,10 +272,7 @@ def verify(input_dir: Path, manifest: Path) -> dict:
                 first = os.fstat(fd)
                 if not stat.S_ISREG(first.st_mode):
                     raise EvidenceError("manifest must be a regular file")
-                with os.fdopen(os.dup(fd), "r", encoding="utf-8") as stream:
-                    expected = json.load(stream)
-                if not _unchanged(first, os.fstat(fd)):
-                    raise EvidenceError("manifest changed while reading")
+                expected = _read_manifest(fd, first)
             finally:
                 os.close(fd)
         actual = _inventory_fd(root_fd)
