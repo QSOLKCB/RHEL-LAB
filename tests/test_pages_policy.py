@@ -1,6 +1,3 @@
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
-Failed to create stream fd: Operation not permitted
 """Pure, offline regression checks for the no-Pages repository policy."""
 from __future__ import annotations
 
