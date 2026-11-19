@@ -24,8 +24,8 @@ def isolated_repo_identity_functions():
     parsed = ast.parse(embedded)
     names = {
         "Refusal", "canonical", "check_dir", "directory",
-        "_git_text_at", "_git_loose_ref", "_git_packed_ref",
-        "_git_head_sha", "repo_state",
+        "_git_bytes_at", "_git_text_at", "_git_ref_component_valid",
+        "_git_loose_ref", "_git_packed_ref", "_git_head_sha", "repo_state",
     }
     selected = [node for node in parsed.body
                 if isinstance(node, (ast.FunctionDef, ast.ClassDef))
@@ -162,6 +162,56 @@ class HostPreflightTests(unittest.TestCase):
             "# pack-refs with: peeled fully-peeled\n"
             + sha + " refs/heads/main\n")
         self.assertEqual(api["repo_state"](checkout)["head_sha"], sha)
+
+    def test_packed_ref_ignores_unrelated_unicode_names(self):
+        api = isolated_repo_identity_functions()
+        checkout, metadata, sha = self.fake_checkout()
+        (metadata / "refs" / "heads" / "main").unlink()
+        (metadata / "packed-refs").write_bytes(
+            ("# pack-refs with: peeled fully-peeled\n"
+             + sha + " refs/heads/main\n"
+             + sha + " refs/tags/版本1\n").encode("utf-8"))
+        self.assertEqual(api["repo_state"](checkout)["head_sha"], sha)
+
+    def test_packed_ref_ignores_unrelated_non_utf8_name(self):
+        api = isolated_repo_identity_functions()
+        checkout, metadata, sha = self.fake_checkout()
+        (metadata / "refs" / "heads" / "main").unlink()
+        (metadata / "packed-refs").write_bytes(
+            b"# pack-refs with: peeled fully-peeled\n" +
+            sha.encode("ascii") + b" refs/heads/main\n" +
+            sha.encode("ascii") + b" refs/tags/binary-\xff\n")
+        self.assertEqual(api["repo_state"](checkout)["head_sha"], sha)
+
+    def test_valid_punctuation_in_branch_head(self):
+        api = isolated_repo_identity_functions()
+        checkout, metadata, sha = self.fake_checkout()
+        (metadata / "HEAD").write_text("ref: refs/heads/release+hotfix\n")
+        (metadata / "refs" / "heads" / "main").unlink()
+        (metadata / "refs" / "heads" / "release+hotfix").write_text(
+            sha + "\n")
+        self.assertEqual(api["repo_state"](checkout)["head_sha"], sha)
+
+    def test_unicode_branch_head_is_supported(self):
+        api = isolated_repo_identity_functions()
+        checkout, metadata, sha = self.fake_checkout()
+        (metadata / "HEAD").write_text(
+            "ref: refs/heads/版本1\n", encoding="utf-8")
+        (metadata / "refs" / "heads" / "main").unlink()
+        (metadata / "refs" / "heads" / "版本1").write_text(sha + "\n")
+        self.assertEqual(api["repo_state"](checkout)["head_sha"], sha)
+
+    def test_forbidden_git_ref_characters_fail_closed(self):
+        api = isolated_repo_identity_functions()
+        checkout, metadata, _ = self.fake_checkout()
+        for ref in ("refs/heads/release?bug", "refs/heads/bad:name",
+                    "refs/heads/main.lock", "refs/heads/hidden..name",
+                    "refs/heads/.hidden", "refs/heads/../outside"):
+            with self.subTest(ref=ref):
+                (metadata / "HEAD").write_text("ref: " + ref + "\n")
+                self.assertEqual(
+                    api["repo_state"](checkout)["status"],
+                    "untrusted_or_unstable_git_metadata")
 
     def test_unsafe_git_ref_path_is_refused(self):
         api = isolated_repo_identity_functions()
