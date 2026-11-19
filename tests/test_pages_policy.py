@@ -219,6 +219,57 @@ class PagesPolicyTests(unittest.TestCase):
             encoding="utf-8")
         policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
+
+    def test_job_permissions_unsupported_forms_fail_closed(self):
+        """Job overrides cannot acquire token writes through YAML spellings."""
+        path = self.workflows / "override.yml"
+        variants = (
+            '    "permissions": write-all\n',
+            "    'permissions': write-all\n",
+            '    permissions: >-\n      write-all\n',
+            '    permissions: |-\n      write-all\n',
+            '    permissions: {contents: write}\n',
+            '    permissions: {"contents": "write"}\n',
+            '    permissions: &p write-all\n',
+            '    permissions: *p\n',
+            '    permissions: {contents: read, "actions": "write"}\n',
+        )
+        for candidate in variants:
+            with self.subTest(candidate=candidate):
+                path.write_text(
+                    "permissions:\n  contents: read\njobs:\n  test:\n"
+                    + candidate + "    steps: []\n", encoding="utf-8")
+                with self.assertRaises(policy.PolicyError):
+                    policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+        path.unlink()
+        for candidate in (
+            "jobs: {test: {permissions: write-all}}\n",
+            "jobs: {test: {permissions: {contents: write}}}\n",
+        ):
+            with self.subTest(candidate=candidate):
+                path.write_text("permissions:\n  contents: read\n" + candidate,
+                                encoding="utf-8")
+                with self.assertRaisesRegex(policy.PolicyError, "permissions"):
+                    policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_explicit_yaml_action_key_rejected(self):
+        path = self.workflows / "explicit.yml"
+        path.write_text(
+            "permissions:\n  contents: read\njobs:\n  test:\n"
+            "    steps:\n      - ? uses\n        : owner/action@deadbeef\n",
+            encoding="utf-8")
+        with self.assertRaisesRegex(policy.PolicyError, "YAML key"):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_yaml_alias_action_bypass_rejected(self):
+        path = self.workflows / "alias.yml"
+        path.write_text(
+            "permissions:\n  contents: read\njobs:\n  test:\n"
+            "    steps:\n      - &bad {uses: owner/action@deadbeef}\n",
+            encoding="utf-8")
+        with self.assertRaisesRegex(policy.PolicyError, "YAML key"):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
     def test_cli_fail_closed(self):
         self.event["repository"]["has_pages"] = True
         file = self.root / "event.json"
