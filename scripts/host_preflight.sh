@@ -262,8 +262,7 @@ def kvm():
         return {"present": False, "char_device": False, "read_write": False}
 
 def _git_bytes_at(parent_fd, name, limit=4096):
-    """Read bounded pinned metadata as bytes; unrelated refs need not be ASCII."""
-    """Read one pinned, no-follow Git metadata file; never run Git itself."""
+    """Read pinned, bounded Git metadata bytes without running any Git code."""
     if "/" in name or name in ("", ".", ".."):
         raise Refusal("invalid Git metadata component")
     fd = os.open(name, READ_FLAGS, dir_fd=parent_fd)
