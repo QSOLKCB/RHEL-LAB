@@ -201,6 +201,16 @@ class HostPreflightTests(unittest.TestCase):
         (metadata / "refs" / "heads" / "版本1").write_text(sha + "\n")
         self.assertEqual(api["repo_state"](checkout)["head_sha"], sha)
 
+    def test_git_valid_unicode_whitespace_is_not_stripped(self):
+        api = isolated_repo_identity_functions()
+        checkout, metadata, sha = self.fake_checkout()
+        branch = "branch\u00a0"
+        (metadata / "HEAD").write_text(
+            "ref: refs/heads/" + branch + "\n", encoding="utf-8")
+        (metadata / "refs" / "heads" / "main").unlink()
+        (metadata / "refs" / "heads" / branch).write_text(sha + "\n")
+        self.assertEqual(api["repo_state"](checkout)["head_sha"], sha)
+
     def test_forbidden_git_ref_characters_fail_closed(self):
         api = isolated_repo_identity_functions()
         checkout, metadata, _ = self.fake_checkout()
