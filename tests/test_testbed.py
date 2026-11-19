@@ -444,6 +444,28 @@ class TestbedTests(unittest.TestCase):
         self.assertEqual(output, "<domain type='kvm'/>")
         self.assertNotIn("warning", output)
 
+    def test_stderr_overflow_is_bounded_independently(self):
+        def verbose_warning(*args, **kwargs):
+            os.write(kwargs["stdout"], b'{"format":"qcow2"}\n')
+            child_stderr = os.dup(kwargs["stderr"])
+            process = Mock()
+            def wait(timeout=None):
+                try:
+                    remaining = memoryview(b"w" * (t.MAX_HELPER_OUTPUT + 4096))
+                    while remaining:
+                        remaining = remaining[os.write(child_stderr, remaining):]
+                finally:
+                    os.close(child_stderr)
+                return 0
+            process.wait.side_effect = wait
+            return process
+
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                t.pinned_helper("qemu-img") as helper, \
+                patch.object(t.subprocess, "Popen", side_effect=verbose_warning):
+            output = t.local_command(helper, ["info"])
+        self.assertEqual(output, '{"format":"qcow2"}')
+
     def test_virsh_rejects_untrusted_runtime_directory(self):
         self.runtime_dir.chmod(0o777)
         with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
