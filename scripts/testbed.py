@@ -539,38 +539,53 @@ def local_command(helper: PinnedHelper, args: list[str], timeout: int = 30,
         extra["preexec_fn"] = partial(
             resource.setrlimit, resource.RLIMIT_FSIZE,
             (file_size_limit, file_size_limit))
-    read_fd, write_fd = os.pipe()
-    captured = bytearray()
-    truncated = False
+    # Two independent streams are mandatory: virsh XML, domstate, and qemu-img
+    # JSON must never be corrupted by harmless diagnostics on stderr.
+    stdout_read, stdout_write = os.pipe()
+    try:
+        stderr_read, stderr_write = os.pipe()
+    except BaseException:
+        os.close(stdout_read)
+        os.close(stdout_write)
+        raise
+    captures = {"stdout": bytearray(), "stderr": bytearray()}
+    truncation = {"stdout": False, "stderr": False}
+    read_errors = []
 
-    def drain_output() -> None:
-        nonlocal truncated
+    def drain_output(fd: int, name: str) -> None:
         try:
             while True:
-                chunk = os.read(read_fd, 65536)
+                chunk = os.read(fd, 65536)
                 if not chunk:
-                    return
-                remaining = MAX_HELPER_OUTPUT - len(captured)
+                    break
+                output = captures[name]
+                remaining = MAX_HELPER_OUTPUT - len(output)
                 if remaining > 0:
-                    captured.extend(chunk[:remaining])
+                    output.extend(chunk[:remaining])
                 if len(chunk) > remaining:
-                    truncated = True
+                    truncation[name] = True
+        except OSError as exc:
+            read_errors.append((name, exc))
         finally:
-            os.close(read_fd)
+            os.close(fd)
 
-    reader = threading.Thread(target=drain_output, daemon=True)
-    process = None
+    out_reader = threading.Thread(
+        target=drain_output, args=(stdout_read, "stdout"), daemon=True)
+    err_reader = threading.Thread(
+        target=drain_output, args=(stderr_read, "stderr"), daemon=True)
     try:
         process = subprocess.Popen(
             argv, executable=f"/proc/self/fd/{helper.fd}",
-            stdin=subprocess.DEVNULL, stdout=write_fd, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, stdout=stdout_write, stderr=stderr_write,
             pass_fds=inherited_fds, env=_command_environment(helper.name), **extra)
     except BaseException:
-        os.close(write_fd)
-        os.close(read_fd)
+        for fd in (stdout_read, stdout_write, stderr_read, stderr_write):
+            os.close(fd)
         raise
-    os.close(write_fd)
-    reader.start()
+    os.close(stdout_write)
+    os.close(stderr_write)
+    out_reader.start()
+    err_reader.start()
     timed_out = None
     try:
         returncode = process.wait(timeout=timeout)
@@ -579,19 +594,32 @@ def local_command(helper: PinnedHelper, args: list[str], timeout: int = 30,
         process.kill()
         returncode = process.wait()
     finally:
-        reader.join()
-    output = bytes(captured).decode("utf-8", errors="backslashreplace")
-    if truncated:
-        output += "\n[output truncated at 1048576 bytes]"
+        # A helper that keeps descendant pipe writers alive must not hang
+        # the clean-room CLI indefinitely after its direct child has exited.
+        out_reader.join(timeout=5)
+        err_reader.join(timeout=5)
+    if out_reader.is_alive() or err_reader.is_alive():
+        raise TestbedError(f"{helper.path} left output pipes open after exit")
+    if read_errors:
+        raise TestbedError(f"{helper.path} output capture failed")
+
+    def diagnostic(name: str) -> str:
+        value = bytes(captures[name]).decode("utf-8", errors="backslashreplace")
+        if truncation[name]:
+            value += f"\n[{name} truncated at {MAX_HELPER_OUTPUT} bytes]"
+        return value
+
+    stdout = diagnostic("stdout")
+    stderr = diagnostic("stderr")
     if timed_out is not None:
         raise TestbedError(
             f"{helper.path} timed out after {timed_out.timeout}s; "
-            f"captured output: {output}") from timed_out
+            f"captured stdout: {stdout}; captured stderr: {stderr}") from timed_out
     if returncode != 0:
         raise TestbedError(
             f"{helper.path} returned exit status {returncode}; "
-            f"captured output: {output}")
-    return output.strip()
+            f"captured stdout: {stdout}; captured stderr: {stderr}")
+    return stdout.strip()
 
 
 def approve(value: str | None, expected: str) -> None:
