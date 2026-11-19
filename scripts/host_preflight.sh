@@ -292,8 +292,10 @@ def _git_bytes_at(parent_fd, name, limit=4096):
 
 def _git_text_at(parent_fd, name, limit=4096):
     """Decode only the specifically requested Git HEAD/ref, not packed refs."""
+    # Git permits non-ASCII whitespace in a refname; strip only the
+    # metadata record's line ending, not valid branch-name characters.
     return _git_bytes_at(parent_fd, name, limit).decode(
-        "utf-8", "surrogateescape").strip()
+        "utf-8", "surrogateescape").removesuffix("\n").removesuffix("\r")
 
 
 def _git_ref_component_valid(part):
