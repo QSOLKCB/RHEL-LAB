@@ -127,6 +127,18 @@ def regular_at(parent_fd: int, name: str) -> int:
     return fd
 
 
+def private_regular_at(parent_fd: int, name: str) -> int:
+    """Pin an operator-owned, private, singly-linked regular child."""
+    fd = regular_at(parent_fd, name)
+    info = os.fstat(fd)
+    if (info.st_uid != os.geteuid() or info.st_mode & 0o077
+            or info.st_nlink != 1):
+        os.close(fd)
+        raise UnsafePath(
+            "regular file must be operator-owned, private, and singly linked")
+    return fd
+
+
 @contextmanager
 def trusted_regular(path: str | Path):
     """Pin a regular file whose owner, mode and ancestors exclude lower trust."""

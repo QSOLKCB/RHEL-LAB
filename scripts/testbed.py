@@ -6,11 +6,15 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
+import resource
+from functools import partial
 import re
 import secrets
 import stat
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,8 +23,9 @@ from typing import Iterator
 from xml.etree import ElementTree as ET
 
 try:
-    from . import safe_fs
+    from . import media_guard, safe_fs
 except ImportError:  # direct invocation
+    import media_guard
     import safe_fs
 
 SCHEMA = "qsol-rhel-testbed/v1"
@@ -41,7 +46,7 @@ HELPER_PATHS = {
     "virsh": Path("/usr/bin/virsh"),
 }
 COMMAND_PATH = "/usr/bin"
-COMMAND_ENV_PASSTHROUGH = ("HOME", "XDG_RUNTIME_DIR")
+MAX_HELPER_OUTPUT = 1024 * 1024
 
 
 class TestbedError(ValueError):
@@ -108,7 +113,7 @@ def read_config(path: Path) -> dict:
     if not isinstance(cfg["name"], str) or NAME.fullmatch(cfg["name"]) is None:
         raise TestbedError("invalid VM name")
     for field, lower, upper in (("vcpus", 1, 32), ("memory_mib", 1024, 32768),
-                                ("disk_gib", 16, 512)):
+                                ("disk_gib", 16, media_guard.MAX_DISK_GIB)):
         if type(cfg[field]) is not int or not lower <= cfg[field] <= upper:
             raise TestbedError(f"{field} must be integer between {lower} and {upper}")
     return cfg
@@ -144,8 +149,8 @@ def iso_file(text: str) -> Path:
     path = absolute_path(text)
     if path.suffix.lower() != ".iso":
         raise TestbedError("ISO must be an existing regular .iso file")
-    with safe_fs.trusted_regular(path):
-        pass
+    with safe_fs.trusted_regular(path) as fd:
+        media_guard.iso_size(fd)
     return path
 
 
@@ -475,21 +480,19 @@ def audit_xml(xml: str, cfg: dict, root: Path) -> None:
         raise TestbedError("disk or ISO missing")
 
 
-def _diagnostic(value: str | bytes | None) -> str:
-    """Retain captured negative-result text across subprocess error types."""
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="backslashreplace")
-    return value
-
-
-def _command_environment() -> dict[str, str]:
+def _command_environment(helper_name: str) -> dict[str, str]:
     environment = {"PATH": COMMAND_PATH, "LC_ALL": "C"}
-    for name in COMMAND_ENV_PASSTHROUGH:
-        value = os.environ.get(name)
-        if value is not None:
-            environment[name] = value
+    if helper_name == "virsh":
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        runtime_text = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
+        runtime = Path(runtime_text)
+        if not runtime.is_absolute() or ".." in runtime.parts:
+            raise TestbedError("XDG_RUNTIME_DIR must be an absolute trusted path")
+        with safe_fs.directory(home):
+            pass
+        with safe_fs.directory(runtime, private=True):
+            pass
+        environment.update({"HOME": str(home), "XDG_RUNTIME_DIR": str(runtime)})
     return environment
 
 
@@ -520,30 +523,103 @@ def pinned_helper(name: str) -> Iterator[PinnedHelper]:
 
 
 def local_command(helper: PinnedHelper, args: list[str], timeout: int = 30,
-                  *, pass_fds: tuple[int, ...] = ()) -> str:
+                  *, pass_fds: tuple[int, ...] = (),
+                  file_size_limit: int | None = None) -> str:
     current = os.fstat(helper.fd)
     if (current.st_dev, current.st_ino) != (helper.device, helper.inode):
         raise TestbedError(f"local dependency identity changed: {helper.path}")
     argv = [str(helper.path), *args]
     inherited_fds = tuple(dict.fromkeys((*pass_fds, helper.fd)))
+    extra = {}
+    if file_size_limit is not None:
+        if type(file_size_limit) is not int or file_size_limit <= 0:
+            raise TestbedError("invalid subprocess file-size budget")
+        # RLIMIT_FSIZE is enforced by the kernel on the child process, not by
+        # periodically inspecting a pathname after conversion.
+        extra["preexec_fn"] = partial(
+            resource.setrlimit, resource.RLIMIT_FSIZE,
+            (file_size_limit, file_size_limit))
+    # Two independent streams are mandatory: virsh XML, domstate, and qemu-img
+    # JSON must never be corrupted by harmless diagnostics on stderr.
+    stdout_read, stdout_write = os.pipe()
     try:
-        result = subprocess.run(
-            argv, executable=f"/proc/self/fd/{helper.fd}", check=True,
-            timeout=timeout, capture_output=True, text=True,
-            pass_fds=inherited_fds, env=_command_environment())
-    except subprocess.CalledProcessError as exc:
-        raise TestbedError(
-            f"{helper.path} returned exit status {exc.returncode}; "
-            f"captured stdout: {_diagnostic(exc.stdout)}; "
-            f"captured stderr: {_diagnostic(exc.stderr)}"
-        ) from exc
+        stderr_read, stderr_write = os.pipe()
+    except BaseException:
+        os.close(stdout_read)
+        os.close(stdout_write)
+        raise
+    captures = {"stdout": bytearray(), "stderr": bytearray()}
+    truncation = {"stdout": False, "stderr": False}
+    read_errors = []
+
+    def drain_output(fd: int, name: str) -> None:
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                output = captures[name]
+                remaining = MAX_HELPER_OUTPUT - len(output)
+                if remaining > 0:
+                    output.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncation[name] = True
+        except OSError as exc:
+            read_errors.append((name, exc))
+        finally:
+            os.close(fd)
+
+    out_reader = threading.Thread(
+        target=drain_output, args=(stdout_read, "stdout"), daemon=True)
+    err_reader = threading.Thread(
+        target=drain_output, args=(stderr_read, "stderr"), daemon=True)
+    try:
+        process = subprocess.Popen(
+            argv, executable=f"/proc/self/fd/{helper.fd}",
+            stdin=subprocess.DEVNULL, stdout=stdout_write, stderr=stderr_write,
+            pass_fds=inherited_fds, env=_command_environment(helper.name), **extra)
+    except BaseException:
+        for fd in (stdout_read, stdout_write, stderr_read, stderr_write):
+            os.close(fd)
+        raise
+    os.close(stdout_write)
+    os.close(stderr_write)
+    out_reader.start()
+    err_reader.start()
+    timed_out = None
+    try:
+        returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        timed_out = exc
+        process.kill()
+        returncode = process.wait()
+    finally:
+        # A helper that keeps descendant pipe writers alive must not hang
+        # the clean-room CLI indefinitely after its direct child has exited.
+        out_reader.join(timeout=5)
+        err_reader.join(timeout=5)
+    if out_reader.is_alive() or err_reader.is_alive():
+        raise TestbedError(f"{helper.path} left output pipes open after exit")
+    if read_errors:
+        raise TestbedError(f"{helper.path} output capture failed")
+
+    def diagnostic(name: str) -> str:
+        value = bytes(captures[name]).decode("utf-8", errors="backslashreplace")
+        if truncation[name]:
+            value += f"\n[{name} truncated at {MAX_HELPER_OUTPUT} bytes]"
+        return value
+
+    stdout = diagnostic("stdout")
+    stderr = diagnostic("stderr")
+    if timed_out is not None:
         raise TestbedError(
-            f"{helper.path} timed out after {exc.timeout}s; "
-            f"captured stdout: {_diagnostic(exc.stdout)}; "
-            f"captured stderr: {_diagnostic(exc.stderr)}"
-        ) from exc
-    return result.stdout.strip()
+            f"{helper.path} timed out after {timed_out.timeout}s; "
+            f"captured stdout: {stdout}; captured stderr: {stderr}") from timed_out
+    if returncode != 0:
+        raise TestbedError(
+            f"{helper.path} returned exit status {returncode}; "
+            f"captured stdout: {stdout}; captured stderr: {stderr}")
+    return stdout.strip()
 
 
 def approve(value: str | None, expected: str) -> None:
@@ -561,6 +637,7 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _copy_iso(source_fd: int, staged_fd: int) -> tuple[str, int]:
+    maximum = media_guard.iso_size(source_fd)
     before = os.fstat(source_fd)
     os.lseek(source_fd, 0, os.SEEK_SET)
     digest = hashlib.sha256()
@@ -569,6 +646,8 @@ def _copy_iso(source_fd: int, staged_fd: int) -> tuple[str, int]:
         chunk = os.read(source_fd, 1024 * 1024)
         if not chunk:
             break
+        if count + len(chunk) > maximum:
+            raise TestbedError("installer ISO grew beyond its approved size during staging")
         _write_all(staged_fd, chunk)
         digest.update(chunk)
         count += len(chunk)
@@ -594,10 +673,13 @@ def _write_json_at(parent_fd: int, name: str, document: dict) -> None:
         os.fsync(stream.fileno())
 
 
-def _stage_iso(root: Path, lab_fd: int, source: Path) -> dict:
+def _stage_iso(root: Path, lab_fd: int, source: Path, disk_bytes: int) -> dict:
     staged_fd = -1
     try:
         with safe_fs.trusted_regular(source) as source_fd:
+            source_bytes = media_guard.iso_size(source_fd)
+            media_guard.require_headroom(
+                lab_fd, source_bytes + disk_bytes, operation="ISO and disk preparation")
             staged_fd = os.open(STAGED_ISO, safe_fs.FILE_RDWR_CREATE_FLAGS,
                                 0o600, dir_fd=lab_fd)
             os.fchmod(staged_fd, 0o600)
@@ -661,16 +743,24 @@ def _read_media_receipt(fd: int, root: Path) -> dict:
     return document
 
 
-def _hash_stable_fd(fd: int, label: str) -> tuple[str, int]:
+def _hash_stable_fd(fd: int, label: str,
+                    max_bytes: int = media_guard.MAX_ISO_BYTES) -> tuple[str, int]:
     before = os.fstat(fd)
+    if before.st_size > max_bytes:
+        raise TestbedError(f"{label} exceeds the approved byte budget")
     if not stat.S_ISREG(before.st_mode):
         raise TestbedError(f"{label} is not a regular file")
     os.lseek(fd, 0, os.SEEK_SET)
     digest = hashlib.sha256()
     count = 0
-    for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
-        digest.update(chunk)
+    while count <= max_bytes:
+        chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - count))
+        if not chunk:
+            break
         count += len(chunk)
+        if count > max_bytes:
+            raise TestbedError(f"{label} exceeds the approved byte budget")
+        digest.update(chunk)
     after = os.fstat(fd)
     if ((before.st_dev, before.st_ino, before.st_size,
          before.st_mtime_ns, before.st_ctime_ns)
@@ -725,14 +815,17 @@ def prepare(cfg: dict, root: Path, iso: Path, token: str | None) -> dict:
         if any(safe_fs.exists_at(lab_fd, name) for name in
                ("disk.qcow2", "domain.xml", STAGED_ISO, MEDIA_RECEIPT)):
             raise TestbedError("refusing to replace existing lab state")
-        media = _stage_iso(root, lab_fd, iso)
+        disk_bytes = cfg["disk_gib"] * media_guard.GIB
+        media = _stage_iso(root, lab_fd, iso, disk_bytes)
         disk_fd = os.open("disk.qcow2",
                           safe_fs.FILE_RDWR_CREATE_FLAGS,
                           0o600, dir_fd=lab_fd)
         try:
             local_command(qemu_img, ["create", "-f", "qcow2",
                           f"/proc/self/fd/{disk_fd}", f"{cfg['disk_gib']}G"],
-                          timeout=120, pass_fds=(disk_fd,))
+                          timeout=120, pass_fds=(disk_fd,),
+                          file_size_limit=media_guard.maximum_qcow2_file_size(disk_bytes))
+            media_guard.qcow2_preflight(disk_fd, disk_bytes)
         finally:
             os.close(disk_fd)
         fd = os.open("domain.xml", safe_fs.FILE_WRITE_FLAGS, 0o600,
@@ -753,7 +846,7 @@ def verify_media(root: Path) -> dict:
     media = verify_staged_iso(root)
     return {"status": "STAGED_ISO_VERIFIED", "iso": media["path"],
             "iso_sha256": media["sha256"], "bytes": media["bytes"],
-            "manual_next": f"virsh -c {URI} define {root / 'domain.xml'}"}
+            "manual_next": f"/usr/bin/virsh -c {URI} define {root / 'domain.xml'}"}
 
 
 def _audit_defined(cfg: dict, root: Path, virsh: PinnedHelper) -> dict:
@@ -772,9 +865,9 @@ def audit_defined(cfg: dict, root: Path) -> dict:
         return _audit_defined(cfg, root, virsh)
 
 
-def hash_fd(fd: int) -> tuple[str, int]:
-    """Hash a stable, already opened regular descriptor."""
-    return _hash_stable_fd(fd, "snapshot output")
+def hash_fd(fd: int, max_bytes: int) -> tuple[str, int]:
+    """Hash a stable, already opened regular descriptor within its output cap."""
+    return _hash_stable_fd(fd, "snapshot output", max_bytes)
 
 
 def snapshot(cfg: dict, root: Path, label: str, sha: str,
@@ -785,19 +878,24 @@ def snapshot(cfg: dict, root: Path, label: str, sha: str,
     with pinned_helper("qemu-img") as qemu_img, \
             pinned_helper("virsh") as virsh, \
             safe_fs.lab_directory(root) as lab_fd:
-        source_fd = safe_fs.regular_at(lab_fd, "disk.qcow2")
+        source_fd = safe_fs.private_regular_at(lab_fd, "disk.qcow2")
         try:
             _audit_defined(cfg, root, virsh)
             state = local_command(
                 virsh, ["-c", URI, "domstate", cfg["name"]])
             if state != "shut off":
                 raise TestbedError(f"domain is not shut off: {state}")
+            disk_bytes = cfg["disk_gib"] * media_guard.GIB
+            output_cap = media_guard.maximum_qcow2_file_size(disk_bytes)
+            media_guard.qcow2_preflight(source_fd, disk_bytes)
             source_path = f"/proc/self/fd/{source_fd}"
             metadata = json.loads(local_command(
                 qemu_img, ["info", "--output=json", source_path],
                 pass_fds=(source_fd,)))
-            if metadata.get("format") != "qcow2" or metadata.get("backing-filename"):
-                raise TestbedError("only standalone QCOW2 images are supported")
+            media_guard.validate_qemu_info(metadata, disk_bytes)
+            # Another process may rewrite source metadata without changing its
+            # descriptor identity; do not proceed if the header drifted.
+            media_guard.qcow2_preflight(source_fd, disk_bytes)
             source_before = os.fstat(source_fd)
             with safe_fs.private_child_directory(lab_fd, "snapshots",
                                                  create=True) as snapshot_fd:
@@ -806,6 +904,8 @@ def snapshot(cfg: dict, root: Path, label: str, sha: str,
                 if (safe_fs.exists_at(snapshot_fd, destination)
                         or safe_fs.exists_at(snapshot_fd, receipt_name)):
                     raise TestbedError("snapshot or receipt already exists")
+                media_guard.require_headroom(
+                    snapshot_fd, output_cap, operation="offline snapshot")
                 temporary = f".pending-{secrets.token_hex(16)}.qcow2"
                 temp_fd = os.open(temporary, safe_fs.FILE_RDWR_CREATE_FLAGS,
                                   0o600, dir_fd=snapshot_fd)
@@ -814,12 +914,14 @@ def snapshot(cfg: dict, root: Path, label: str, sha: str,
                     local_command(qemu_img,
                                   ["convert", "-f", "qcow2", "-O", "qcow2",
                                    source_path, f"/proc/self/fd/{temp_fd}"],
-                                  timeout=3600, pass_fds=(source_fd, temp_fd))
+                                  timeout=3600, pass_fds=(source_fd, temp_fd),
+                                  file_size_limit=output_cap)
                     source_after = os.fstat(source_fd)
                     if ((source_before.st_size, source_before.st_mtime_ns, source_before.st_ctime_ns)
                          != (source_after.st_size, source_after.st_mtime_ns, source_after.st_ctime_ns)):
                         raise TestbedError("source disk changed during offline copy")
-                    digest, size = hash_fd(temp_fd)
+                    media_guard.qcow2_preflight(temp_fd, disk_bytes)
+                    digest, size = hash_fd(temp_fd, output_cap)
                     report = {
                         "schema": "qsol-rhel-snapshot/v1", "domain": cfg["name"],
                         "label": label, "source_commit": sha, "sha256": digest,
@@ -837,13 +939,16 @@ def snapshot(cfg: dict, root: Path, label: str, sha: str,
                         stream.write("\n")
                         stream.flush()
                         os.fsync(stream.fileno())
+                    os.fsync(snapshot_fd)
                 except Exception:
                     if published:
                         os.unlink(destination, dir_fd=snapshot_fd)
+                        os.fsync(snapshot_fd)
                     raise
                 finally:
                     os.close(temp_fd)
                     os.unlink(temporary, dir_fd=snapshot_fd)
+                    os.fsync(snapshot_fd)
         finally:
             os.close(source_fd)
     return {"status": "SNAPSHOT_CREATED",

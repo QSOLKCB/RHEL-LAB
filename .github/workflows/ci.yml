@@ -3,7 +3,9 @@ name: Source checks
 on:
   push:
     branches: [main]
-  pull_request:
+  # Candidate code is never executed for a pull request. This event runs the
+  # validator and workflow from the trusted target branch instead.
+  pull_request_target:
   workflow_dispatch:
 
 permissions:
@@ -12,6 +14,7 @@ permissions:
 jobs:
   unit-tests:
     name: Python ${{ matrix.python-version }} tests (no VM testing)
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
@@ -37,17 +40,25 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Checkout
+      - name: Checkout trusted validator
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: trusted
+          persist-credentials: false
+      - name: Checkout candidate as inert data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
           persist-credentials: false
       - name: Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - name: Check GitHub event and committed workflows (no network)
+      - name: Check GitHub event and candidate workflows with trusted code
         run: |
-          python -m scripts.pages_policy \
+          python -I trusted/scripts/pages_policy.py \
             --event "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \
-            --workflows .github/workflows
+            --workflows candidate/.github/workflows

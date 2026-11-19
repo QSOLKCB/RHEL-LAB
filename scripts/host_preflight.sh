@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-exec /usr/bin/python3 - "$@" <<'PYTHON'
+exec /usr/bin/python3 -I - "$@" <<'PYTHON'
 from __future__ import annotations
 import argparse
 import datetime
@@ -31,6 +31,9 @@ class Refusal(ValueError):
 
 def canonical(path):
     path = pathlib.Path(path)
+    if any(ord(character) < 32 or ord(character) == 127
+           for character in os.fspath(path)):
+        raise Refusal("control characters are forbidden in host paths")
     if ".." in path.parts:
         raise Refusal("parent traversal is forbidden")
     if not path.is_absolute():
@@ -163,19 +166,22 @@ def child_limits():
     resource.setrlimit(resource.RLIMIT_FSIZE, (128 * 1024, 128 * 1024))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
-def run(name, *args):
+def run(name, *args, pass_fds=()):
     exe = binary(name)
     if exe is None:
         return {"status": "unavailable_or_untrusted"}
     env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C",
            "LANG": "C", "HOME": str(pathlib.Path.home()),
-           "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1"}
+           "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+           "GIT_TERMINAL_PROMPT": "0"}
     with tempfile.TemporaryFile() as output:
         try:
             process = subprocess.Popen([exe, *args], env=env,
                                        stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=subprocess.STDOUT,
-                                       close_fds=True, preexec_fn=child_limits)
+                                       close_fds=True, pass_fds=pass_fds,
+                                       preexec_fn=child_limits)
         except OSError as exc:
             return {"status": "launch_error", "type": type(exc).__name__}
         try:
@@ -255,19 +261,149 @@ def kvm():
     except OSError:
         return {"present": False, "char_device": False, "read_write": False}
 
+def _git_bytes_at(parent_fd, name, limit=4096):
+    """Read pinned, bounded Git metadata bytes without running any Git code."""
+    if "/" in name or name in ("", ".", ".."):
+        raise Refusal("invalid Git metadata component")
+    fd = os.open(name, READ_FLAGS, dir_fd=parent_fd)
+    try:
+        first = os.fstat(fd)
+        if (not stat.S_ISREG(first.st_mode) or
+                first.st_uid not in (0, os.geteuid()) or
+                first.st_mode & 0o022 or first.st_size > limit):
+            raise Refusal("untrusted or oversized Git metadata")
+        chunks = []
+        count = 0
+        while count <= limit:
+            chunk = os.read(fd, min(4096, limit + 1 - count))
+            if not chunk:
+                break
+            count += len(chunk)
+            chunks.append(chunk)
+        last = os.fstat(fd)
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size,
+                              s.st_mtime_ns, s.st_ctime_ns)
+        if count > limit or count != first.st_size or identity(first) != identity(last):
+            raise Refusal("Git metadata changed during inspection")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _git_text_at(parent_fd, name, limit=4096):
+    """Decode only the specifically requested Git HEAD/ref, not packed refs."""
+    # Git permits non-ASCII whitespace in a refname; strip only the
+    # metadata record's line ending, not valid branch-name characters.
+    return _git_bytes_at(parent_fd, name, limit).decode(
+        "utf-8", "surrogateescape").removesuffix("\n").removesuffix("\r")
+
+
+def _git_ref_component_valid(part):
+    """Git refname punctuation rules without filesystem path traversal."""
+    return (bool(part) and len(os.fsencode(part)) <= 255
+            and not part.startswith(".") and not part.endswith((".", ".lock"))
+            and ".." not in part and "@{" not in part
+            and not any(ord(ch) < 32 or ord(ch) == 127
+                        or ch in " ~^:?*[\\"
+                        for ch in part))
+
+
+def _git_loose_ref(git_fd, ref):
+    """Resolve a heads-only ref relative to pinned .git; refuse symlink paths."""
+    parts = ref.split("/")
+    if (parts[:2] != ["refs", "heads"] or
+            len(parts) < 3 or
+            any(not _git_ref_component_valid(part) for part in parts)):
+        raise Refusal("unsupported or unsafe Git symbolic ref")
+    fd = os.dup(git_fd)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            try:
+                check_dir(os.fstat(child))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(fd)
+            fd = child
+        return _git_text_at(fd, parts[-1])
+    finally:
+        os.close(fd)
+
+
+def _git_packed_ref(git_fd, ref):
+    # packed-refs may contain unrelated Unicode/non-ASCII refs. Treat its
+    # contents as bytes, compare just the requested name, decode only SHA.
+    packed = _git_bytes_at(git_fd, "packed-refs", 262144)
+    expected_name = os.fsencode(ref)
+    for line in packed.splitlines():
+        if not line or line.startswith((b"#", b"^")):
+            continue
+        fields = line.split(b" ")
+        if len(fields) == 2 and fields[1] == expected_name:
+            return fields[0].decode("ascii")
+    raise Refusal("Git HEAD ref not present in packed-refs")
+
+
+def _git_head_sha(git_fd):
+    """Read HEAD and its target from the pinned metadata directory, no filters."""
+    head = _git_text_at(git_fd, "HEAD")
+    if re.fullmatch(r"[0-9a-f]{40}", head):
+        if _git_text_at(git_fd, "HEAD") != head:
+            raise Refusal("Git detached HEAD changed during inspection")
+        return head
+    if not head.startswith("ref: "):
+        raise Refusal("unsupported Git HEAD representation")
+    ref = head[5:]
+    try:
+        sha = _git_loose_ref(git_fd, ref)
+        packed = False
+    except FileNotFoundError:
+        sha = _git_packed_ref(git_fd, ref)
+        packed = True
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise Refusal("invalid or missing pinned Git ref")
+    if _git_text_at(git_fd, "HEAD") != head:
+        raise Refusal("Git HEAD changed while inspecting")
+    second = _git_packed_ref(git_fd, ref) if packed else _git_loose_ref(git_fd, ref)
+    if second != sha:
+        raise Refusal("Git ref changed during inspection")
+    return sha
+
+
 def repo_state(path):
+    """Report pinned HEAD only; never evaluate Git config, hooks, filters or diff."""
     if path is None:
         return {"status": "not_supplied"}
     folder = canonical(path)
-    if not folder.is_dir():
-        return {"status": "not_found"}
-    result = run("git", "-C", str(folder), "rev-parse", "--verify", "HEAD")
-    sha = result.get("output", "")
-    if result.get("exit_code") != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
-        return {"status": "not_a_checkout"}
-    changed = run("git", "-C", str(folder), "diff", "--quiet", "HEAD", "--")
-    return {"status": "identified", "head_sha": sha,
-            "tracked_changes": changed.get("exit_code") == 1}
+    try:
+        folder_fd = directory(folder)
+    except (FileNotFoundError, NotADirectoryError, Refusal):
+        return {"status": "not_found_or_untrusted"}
+    try:
+        try:
+            git_fd = os.open(".git", DIR_FLAGS, dir_fd=folder_fd)
+        except (OSError, ValueError):
+            return {"status": "no_trusted_git_metadata"}
+        try:
+            check_dir(os.fstat(git_fd))
+            sha = _git_head_sha(git_fd)
+            # A metadata directory swapped after opening cannot redirect the
+            # pinned reads and must not silently be reported as current.
+            current = os.stat(".git", dir_fd=folder_fd, follow_symlinks=False)
+            pinned = os.fstat(git_fd)
+            if ((current.st_dev, current.st_ino) !=
+                    (pinned.st_dev, pinned.st_ino)):
+                raise Refusal("Git metadata directory rebound during inspection")
+            return {"status": "identified", "head_sha": sha,
+                    "tracked_changes": None,
+                    "tracked_changes_status": "not_checked_to_avoid_git_execution"}
+        except (OSError, ValueError):
+            return {"status": "untrusted_or_unstable_git_metadata"}
+        finally:
+            os.close(git_fd)
+    finally:
+        os.close(folder_fd)
 
 def capture(session, repo):
     uname = os.uname()

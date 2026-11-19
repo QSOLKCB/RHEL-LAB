@@ -25,7 +25,57 @@ PUBLISH_MARKERS = (
     re.compile(r"""(?im)^[ \t]*["']?pages["']?[ \t]*:[ \t]*["']?write["']?(?=[ \t]*(?:#|$))"""),
     re.compile(r"""(?i)[,{][ \t\r\n]*["']?pages["']?[ \t]*:[ \t]*["']?write["']?(?=[ \t]*(?:,|\}|#|$))"""),
     re.compile(r"\bgh-pages\b", re.I),
+    re.compile(r"(?im)^[ \t]*permissions[ \t]*:[ \t]*[\"']?write-all[\"']?(?:[ \t]*(?:#.*)?)$"),
+    re.compile(r"(?im)^[ \t]*[\"']?[a-z][a-z-]*[\"']?[ \t]*:[ \t]*[\"']?write[\"']?(?:[ \t]*(?:#.*)?)$"),
+    # A job may override safe workflow-level permissions with a flow mapping.
+    re.compile(
+        r"(?ims)^[ \t]*[\"']?permissions[\"']?[ \t]*:[ \t]*\{"
+        r"(?=[^}]*[\"']?[a-z][a-z-]*[\"']?[ \t]*:[ \t]*"
+        r"[\"']?write[\"']?[ \t]*(?:,|\}))[^}]*\}"),
+    re.compile(r"(?i)\b(?:api\.github\.com/repos/[^\s]+/pages|/pages/builds|/pages/deployment)\b"),
 )
+
+ALLOWED_ACTIONS = frozenset({
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",  # v7.0.1
+    "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",  # v7.0.0
+})
+USES = re.compile(
+    r"(?im)^[ \t]*(?:-[ \t]*)?[\"']?uses[\"']?[ \t]*:[ \t]*([^#\r\n]+)")
+# Any flow-style or otherwise unparsed uses key is rejected. Supporting only
+# one-key-per-line forms keeps this stdlib-only scanner fail-closed.
+USES_KEY = re.compile(
+    r"(?im)(?:^[ \t]*(?:-[ \t]*)?|[,{][ \t\r\n]*)"
+    r"[\"']?uses[\"']?[ \t]*:")
+TOP_LEVEL_READ = re.compile(
+    r"(?m)^permissions:[ \t]*(?:\r?\n)[ \t]+contents:[ \t]*[\"']?read[\"']?(?:[ \t]*(?:#.*)?)$")
+
+# The no-Pages guard is deliberately NOT a general-purpose YAML parser.
+# Only a single top-level block-style permissions declaration is accepted.
+# Every other declaration (job override, flow mapping, folded scalar, quoted
+# key, duplicate key, etc.) fails closed. A README or shell script containing
+# the literal syntax may also be rejected, which is intentional here.
+PERMISSIONS_KEYS = re.compile(
+    r"""(?im)(?<![A-Za-z0-9_-])(?:"permissions"|'permissions'|permissions)[ \t]*:""")
+TOP_LEVEL_PERMISSIONS_DECL = re.compile(r"(?m)^permissions:[ \t]*(?:#.*)?$")
+EXPLICIT_YAML_KEY = re.compile(r"(?m)^[ \t]*(?:-[ \t]*)?\?(?=[ \t]|$)")
+YAML_MERGE_KEY = re.compile(r"(?m)(?:^|[ \t,{])(?:<<|['\"]<<['\"])[ \t]*:")
+YAML_ANCHOR = re.compile(r"(?m)(?:^|[ \t,:-])[&*][A-Za-z_][A-Za-z0-9_-]*")
+
+
+def _require_readonly_permissions(source: str, filename: str) -> None:
+    """Reject permission grammars that cannot be audited without a YAML parser."""
+    declaration = TOP_LEVEL_PERMISSIONS_DECL.search(source)
+    occurrences = list(PERMISSIONS_KEYS.finditer(source))
+    if (declaration is None or len(occurrences) != 1 or
+            declaration.start() != occurrences[0].start()):
+        raise PolicyError(
+            f"workflow has unsupported, duplicate, or job-level permissions: {filename!r}")
+    if TOP_LEVEL_READ.search(source) is None:
+        raise PolicyError(
+            f"workflow lacks explicit top-level contents: read permissions: {filename!r}")
+    if (EXPLICIT_YAML_KEY.search(source) or YAML_MERGE_KEY.search(source)
+            or YAML_ANCHOR.search(source)):
+        raise PolicyError(f"unsupported YAML key, anchor or merge: {filename!r}")
 
 
 _YAML_SIMPLE_ESCAPES = {
@@ -119,6 +169,15 @@ def check(event: object, repository: str, workflows: Path) -> None:
         canonical = _canonicalize_yaml_escapes(active)
         if any(marker.search(canonical) for marker in PUBLISH_MARKERS):
             raise PolicyError(f"Pages deployment reference in {path.name!r}")
+        _require_readonly_permissions(canonical, path.name)
+        uses = list(USES.finditer(canonical))
+        if USES_KEY.search(USES.sub("", canonical)):
+            raise PolicyError(f"unsupported uses representation in {path.name!r}")
+        for match in uses:
+            action = match.group(1).strip().strip("\"'")
+            if action not in ALLOWED_ACTIONS:
+                raise PolicyError(
+                    f"unapproved local, reusable, or third-party action in {path.name!r}")
 
 
 def main(argv: list[str] | None = None) -> int:

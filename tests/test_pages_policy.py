@@ -52,6 +52,65 @@ class PagesPolicyTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError):
             policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
+    def test_write_all_permission_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions: write-all\n", encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_unapproved_action_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions:\n  contents: read\nsteps:\n"
+            "  - uses: ./.github/actions/publish\n", encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_named_unapproved_action_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions:\n  contents: read\njobs:\n  test:\n    steps:\n"
+            "      - name: Unapproved\n        uses: owner/action@deadbeef\n",
+            encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_job_level_reusable_workflow_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions:\n  contents: read\njobs:\n  publish:\n"
+            "    uses: owner/repository/.github/workflows/publish.yml@main\n",
+            encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_flow_style_uses_is_rejected_as_unsupported(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions:\n  contents: read\njobs:\n  test:\n"
+            "    steps: [{name: Unapproved, uses: owner/action@deadbeef}]\n",
+            encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_named_approved_action_is_allowed(self):
+        (self.workflows / "safe.yml").write_text(
+            "permissions:\n  contents: read\njobs:\n  test:\n    steps:\n"
+            "      - name: Checkout\n"
+            "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n",
+            encoding="utf-8")
+        policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_missing_explicit_read_permissions_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "name: inherits repository defaults\n", encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_direct_pages_api_rejected(self):
+        (self.workflows / "bad.yml").write_text(
+            "permissions:\n  contents: read\nsteps:\n"
+            "  - run: curl https://api.github.com/repos/o/r/pages\n",
+            encoding="utf-8")
+        with self.assertRaises(policy.PolicyError):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
     def test_inline_pages_write_permission_rejected(self):
         (self.workflows / "inline.yml").write_text(
             "permissions: {pages: write}\n", encoding="utf-8")
@@ -70,6 +129,22 @@ class PagesPolicyTests(unittest.TestCase):
             encoding="utf-8")
         with self.assertRaises(policy.PolicyError):
             policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_job_flow_write_permissions_rejected(self):
+        path = self.workflows / "bad.yml"
+        cases = (
+            "permissions: {contents: write, actions: write}",
+            "permissions: {contents: read, 'actions': 'write'}",
+        )
+        for permissions in cases:
+            with self.subTest(permissions=permissions):
+                path.write_text(
+                    "permissions:\n  contents: read\njobs:\n  test:\n    "
+                    + permissions + "\n    steps: []\n",
+                    encoding="utf-8")
+                with self.assertRaises(policy.PolicyError):
+                    policy.check(self.event, "QSOLKCB/RHEL-LAB",
+                                 self.workflows)
 
     def test_single_quoted_permissions_rejected(self):
         (self.workflows / "quoted.yml").write_text(
@@ -92,7 +167,7 @@ class PagesPolicyTests(unittest.TestCase):
 
     def test_similar_permission_value_not_rejected(self):
         (self.workflows / "other.yml").write_text(
-            'permissions: {pages: readonly, contents: read}\n',
+            "permissions:\n  contents: read\n  pages: readonly\n",
             encoding="utf-8")
         policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
@@ -132,15 +207,68 @@ class PagesPolicyTests(unittest.TestCase):
 
     def test_escaped_backslash_is_not_recursively_decoded(self):
         (self.workflows / "safe.yml").write_text(
+            'permissions:\n  contents: read\n'
             'run: "printf actions\\\\u002fdeploy-pages@v4"\n',
             encoding="utf-8")
         policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
     def test_comment_alone_not_a_publishing_workflow(self):
         (self.workflows / "safe.yaml").write_text(
-            "# This workflow never calls actions/deploy-pages@v4\nname: Safe\n",
+            "# This workflow never calls actions/deploy-pages@v4\n"
+            "name: Safe\npermissions:\n  contents: read\n",
             encoding="utf-8")
         policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+
+    def test_job_permissions_unsupported_forms_fail_closed(self):
+        """Job overrides cannot acquire token writes through YAML spellings."""
+        path = self.workflows / "override.yml"
+        variants = (
+            '    "permissions": write-all\n',
+            "    'permissions': write-all\n",
+            '    permissions: >-\n      write-all\n',
+            '    permissions: |-\n      write-all\n',
+            '    permissions: {contents: write}\n',
+            '    permissions: {"contents": "write"}\n',
+            '    permissions: &p write-all\n',
+            '    permissions: *p\n',
+            '    permissions: {contents: read, "actions": "write"}\n',
+        )
+        for candidate in variants:
+            with self.subTest(candidate=candidate):
+                path.write_text(
+                    "permissions:\n  contents: read\njobs:\n  test:\n"
+                    + candidate + "    steps: []\n", encoding="utf-8")
+                with self.assertRaises(policy.PolicyError):
+                    policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+        path.unlink()
+        for candidate in (
+            "jobs: {test: {permissions: write-all}}\n",
+            "jobs: {test: {permissions: {contents: write}}}\n",
+        ):
+            with self.subTest(candidate=candidate):
+                path.write_text("permissions:\n  contents: read\n" + candidate,
+                                encoding="utf-8")
+                with self.assertRaisesRegex(policy.PolicyError, "permissions"):
+                    policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_explicit_yaml_action_key_rejected(self):
+        path = self.workflows / "explicit.yml"
+        path.write_text(
+            "permissions:\n  contents: read\njobs:\n  test:\n"
+            "    steps:\n      - ? uses\n        : owner/action@deadbeef\n",
+            encoding="utf-8")
+        with self.assertRaisesRegex(policy.PolicyError, "YAML key"):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
+
+    def test_yaml_alias_action_bypass_rejected(self):
+        path = self.workflows / "alias.yml"
+        path.write_text(
+            "permissions:\n  contents: read\njobs:\n  test:\n"
+            "    steps:\n      - &bad {uses: owner/action@deadbeef}\n",
+            encoding="utf-8")
+        with self.assertRaisesRegex(policy.PolicyError, "YAML key"):
+            policy.check(self.event, "QSOLKCB/RHEL-LAB", self.workflows)
 
     def test_cli_fail_closed(self):
         self.event["repository"]["has_pages"] = True
