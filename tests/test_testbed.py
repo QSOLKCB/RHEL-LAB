@@ -374,7 +374,8 @@ class TestbedTests(unittest.TestCase):
 
     def test_failed_subprocess_retains_stderr_and_stdout(self):
         def failed_process(*args, **kwargs):
-            os.write(kwargs["stdout"], b"partial output\npermission denied")
+            os.write(kwargs["stdout"], b"partial output")
+            os.write(kwargs["stderr"], b"permission denied")
             process = Mock()
             process.wait.return_value = 7
             return process
@@ -390,7 +391,8 @@ class TestbedTests(unittest.TestCase):
 
     def test_timeout_preserves_partial_diagnostics(self):
         def timed_out_process(*args, **kwargs):
-            os.write(kwargs["stdout"], b"partial\xff\ndisk full")
+            os.write(kwargs["stdout"], b"partial\xff")
+            os.write(kwargs["stderr"], b"disk full")
             process = Mock()
             process.wait.side_effect = [
                 subprocess.TimeoutExpired(["qemu-img", "convert"], 3), 0]
@@ -423,8 +425,24 @@ class TestbedTests(unittest.TestCase):
                 t.pinned_helper("qemu-img") as qemu_img, \
                 patch.object(t.subprocess, "Popen", side_effect=noisy_process):
             output = t.local_command(qemu_img, ["info"])
-        self.assertIn("[output truncated at 1048576 bytes]", output)
+        self.assertIn("[stdout truncated at 1048576 bytes]", output)
         self.assertLessEqual(len(output), t.MAX_HELPER_OUTPUT + 64)
+
+    def test_successful_helper_stderr_not_mixed_into_stdout(self):
+        def noisy_but_successful(*args, **kwargs):
+            os.write(kwargs["stdout"], b"<domain type='kvm'/>\n")
+            os.write(kwargs["stderr"], b"libvirt: harmless warning\n")
+            process = Mock()
+            process.wait.return_value = 0
+            return process
+
+        with patch.dict(t.HELPER_PATHS, self.helper_paths, clear=True), \
+                t.pinned_helper("qemu-img") as helper, \
+                patch.object(t.subprocess, "Popen",
+                             side_effect=noisy_but_successful):
+            output = t.local_command(helper, ["info"])
+        self.assertEqual(output, "<domain type='kvm'/>")
+        self.assertNotIn("warning", output)
 
     def test_virsh_rejects_untrusted_runtime_directory(self):
         self.runtime_dir.chmod(0o777)
