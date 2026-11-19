@@ -261,7 +261,8 @@ def kvm():
     except OSError:
         return {"present": False, "char_device": False, "read_write": False}
 
-def _git_text_at(parent_fd, name, limit=4096):
+def _git_bytes_at(parent_fd, name, limit=4096):
+    """Read bounded pinned metadata as bytes; unrelated refs need not be ASCII."""
     """Read one pinned, no-follow Git metadata file; never run Git itself."""
     if "/" in name or name in ("", ".", ".."):
         raise Refusal("invalid Git metadata component")
@@ -285,9 +286,25 @@ def _git_text_at(parent_fd, name, limit=4096):
                               s.st_mtime_ns, s.st_ctime_ns)
         if count > limit or count != first.st_size or identity(first) != identity(last):
             raise Refusal("Git metadata changed during inspection")
-        return b"".join(chunks).decode("ascii").strip()
+        return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def _git_text_at(parent_fd, name, limit=4096):
+    """Decode only the specifically requested Git HEAD/ref, not packed refs."""
+    return _git_bytes_at(parent_fd, name, limit).decode(
+        "utf-8", "surrogateescape").strip()
+
+
+def _git_ref_component_valid(part):
+    """Git refname punctuation rules without filesystem path traversal."""
+    return (bool(part) and len(os.fsencode(part)) <= 255
+            and not part.startswith(".") and not part.endswith((".", ".lock"))
+            and ".." not in part and "@{" not in part
+            and not any(ord(ch) < 32 or ord(ch) == 127
+                        or ch in " ~^:?*[\\"
+                        for ch in part))
 
 
 def _git_loose_ref(git_fd, ref):
@@ -295,9 +312,7 @@ def _git_loose_ref(git_fd, ref):
     parts = ref.split("/")
     if (parts[:2] != ["refs", "heads"] or
             len(parts) < 3 or
-            any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", part)
-                or part.endswith(".lock") or part in (".", "..")
-                for part in parts)):
+            any(not _git_ref_component_valid(part) for part in parts)):
         raise Refusal("unsupported or unsafe Git symbolic ref")
     fd = os.dup(git_fd)
     try:
@@ -316,13 +331,16 @@ def _git_loose_ref(git_fd, ref):
 
 
 def _git_packed_ref(git_fd, ref):
-    packed = _git_text_at(git_fd, "packed-refs", 262144)
+    # packed-refs may contain unrelated Unicode/non-ASCII refs. Treat its
+    # contents as bytes, compare just the requested name, decode only SHA.
+    packed = _git_bytes_at(git_fd, "packed-refs", 262144)
+    expected_name = os.fsencode(ref)
     for line in packed.splitlines():
-        if not line or line.startswith(("#", "^")):
+        if not line or line.startswith((b"#", b"^")):
             continue
-        fields = line.split(" ")
-        if len(fields) == 2 and fields[1] == ref:
-            return fields[0]
+        fields = line.split(b" ")
+        if len(fields) == 2 and fields[1] == expected_name:
+            return fields[0].decode("ascii")
     raise Refusal("Git HEAD ref not present in packed-refs")
 
 
